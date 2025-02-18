@@ -73,6 +73,7 @@ class AbstractClient(object):
         metadata: Optional[Dict] = {"human:": DEFAULT_HUMAN, "persona": DEFAULT_PERSONA},
         description: Optional[str] = None,
         tags: Optional[List[str]] = None,
+        message_buffer_autoclear: bool = False,
     ) -> AgentState:
         raise NotImplementedError
 
@@ -463,7 +464,7 @@ class RESTClient(AbstractClient):
         if token:
             self.headers = {"accept": "application/json", "Authorization": f"Bearer {token}"}
         elif password:
-            self.headers = {"accept": "application/json", "X-BARE-PASSWORD": f"password {password}"}
+            self.headers = {"accept": "application/json", "Authorization": f"Bearer {password}"}
         else:
             self.headers = {"accept": "application/json"}
         if headers:
@@ -540,6 +541,7 @@ class RESTClient(AbstractClient):
         description: Optional[str] = None,
         initial_message_sequence: Optional[List[Message]] = None,
         tags: Optional[List[str]] = None,
+        message_buffer_autoclear: bool = False,
     ) -> AgentState:
         """Create an agent
 
@@ -600,6 +602,7 @@ class RESTClient(AbstractClient):
             "initial_message_sequence": initial_message_sequence,
             "tags": tags,
             "include_base_tools": include_base_tools,
+            "message_buffer_autoclear": message_buffer_autoclear,
         }
 
         # Only add name if it's not None
@@ -2353,6 +2356,7 @@ class LocalClient(AbstractClient):
         description: Optional[str] = None,
         initial_message_sequence: Optional[List[Message]] = None,
         tags: Optional[List[str]] = None,
+        message_buffer_autoclear: bool = False,
     ) -> AgentState:
         """Create an agent
 
@@ -2404,6 +2408,7 @@ class LocalClient(AbstractClient):
             "embedding_config": embedding_config if embedding_config else self._default_embedding_config,
             "initial_message_sequence": initial_message_sequence,
             "tags": tags,
+            "message_buffer_autoclear": message_buffer_autoclear,
         }
 
         # Only add name if it's not None
@@ -2950,18 +2955,11 @@ class LocalClient(AbstractClient):
             langchain_tool=langchain_tool,
             additional_imports_module_attr_map=additional_imports_module_attr_map,
         )
-        return self.server.tool_manager.create_or_update_tool(pydantic_tool=Tool(**tool_create.model_dump()), actor=self.user)
-
-    def load_crewai_tool(self, crewai_tool: "CrewAIBaseTool", additional_imports_module_attr_map: dict[str, str] = None) -> Tool:
-        tool_create = ToolCreate.from_crewai(
-            crewai_tool=crewai_tool,
-            additional_imports_module_attr_map=additional_imports_module_attr_map,
-        )
-        return self.server.tool_manager.create_or_update_tool(pydantic_tool=Tool(**tool_create.model_dump()), actor=self.user)
+        return self.server.tool_manager.create_or_update_langchain_tool(tool_create=tool_create, actor=self.user)
 
     def load_composio_tool(self, action: "ActionType") -> Tool:
         tool_create = ToolCreate.from_composio(action_name=action.name)
-        return self.server.tool_manager.create_or_update_composio_tool(pydantic_tool=Tool(**tool_create.model_dump()), actor=self.user)
+        return self.server.tool_manager.create_or_update_composio_tool(tool_create=tool_create, actor=self.user)
 
     def create_tool(
         self,

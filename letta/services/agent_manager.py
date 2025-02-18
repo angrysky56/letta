@@ -6,6 +6,7 @@ from sqlalchemy import Select, and_, func, literal, or_, select, union_all
 
 from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS, MAX_EMBEDDING_DIM, MULTI_AGENT_TOOLS
 from letta.embeddings import embedding_model
+from letta.helpers.datetime_helpers import get_utc_time
 from letta.log import get_logger
 from letta.orm import Agent as AgentModel
 from letta.orm import AgentPassage, AgentsTags
@@ -42,7 +43,7 @@ from letta.services.message_manager import MessageManager
 from letta.services.source_manager import SourceManager
 from letta.services.tool_manager import ToolManager
 from letta.settings import settings
-from letta.utils import enforce_types, get_utc_time, united_diff
+from letta.utils import enforce_types, united_diff
 
 logger = get_logger(__name__)
 
@@ -120,6 +121,10 @@ class AgentManager:
             metadata=agent_create.metadata,
             tool_rules=agent_create.tool_rules,
             actor=actor,
+            project_id=agent_create.project_id,
+            template_id=agent_create.template_id,
+            base_template_id=agent_create.base_template_id,
+            message_buffer_autoclear=agent_create.message_buffer_autoclear,
         )
 
         # If there are provided environment variables, add them in
@@ -179,6 +184,10 @@ class AgentManager:
         description: Optional[str] = None,
         metadata: Optional[Dict] = None,
         tool_rules: Optional[List[PydanticToolRule]] = None,
+        project_id: Optional[str] = None,
+        template_id: Optional[str] = None,
+        base_template_id: Optional[str] = None,
+        message_buffer_autoclear: bool = False,
     ) -> PydanticAgentState:
         """Create a new agent."""
         with self.session_maker() as session:
@@ -193,6 +202,10 @@ class AgentManager:
                 "description": description,
                 "metadata_": metadata,
                 "tool_rules": tool_rules,
+                "project_id": project_id,
+                "template_id": template_id,
+                "base_template_id": base_template_id,
+                "message_buffer_autoclear": message_buffer_autoclear,
             }
 
             # Create the new agent using SqlalchemyBase.create
@@ -242,7 +255,20 @@ class AgentManager:
             agent = AgentModel.read(db_session=session, identifier=agent_id, actor=actor)
 
             # Update scalar fields directly
-            scalar_fields = {"name", "system", "llm_config", "embedding_config", "message_ids", "tool_rules", "description", "metadata"}
+            scalar_fields = {
+                "name",
+                "system",
+                "llm_config",
+                "embedding_config",
+                "message_ids",
+                "tool_rules",
+                "description",
+                "metadata",
+                "project_id",
+                "template_id",
+                "base_template_id",
+                "message_buffer_autoclear",
+            }
             for field in scalar_fields:
                 value = getattr(agent_update, field, None)
                 if value is not None:
@@ -456,39 +482,40 @@ class AgentManager:
             )
             message = self.message_manager.create_message(message, actor=actor)
             message_ids = [message.id] + agent_state.message_ids[1:]  # swap index 0 (system)
-            return self.set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
+            return self._set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
         else:
             return agent_state
 
     @enforce_types
-    def set_in_context_messages(self, agent_id: str, message_ids: List[str], actor: PydanticUser) -> PydanticAgentState:
+    def _set_in_context_messages(self, agent_id: str, message_ids: List[str], actor: PydanticUser) -> PydanticAgentState:
         return self.update_agent(agent_id=agent_id, agent_update=UpdateAgent(message_ids=message_ids), actor=actor)
 
     @enforce_types
     def trim_older_in_context_messages(self, num: int, agent_id: str, actor: PydanticUser) -> PydanticAgentState:
         message_ids = self.get_agent_by_id(agent_id=agent_id, actor=actor).message_ids
         new_messages = [message_ids[0]] + message_ids[num:]  # 0 is system message
-        return self.set_in_context_messages(agent_id=agent_id, message_ids=new_messages, actor=actor)
+        return self._set_in_context_messages(agent_id=agent_id, message_ids=new_messages, actor=actor)
 
     @enforce_types
     def trim_all_in_context_messages_except_system(self, agent_id: str, actor: PydanticUser) -> PydanticAgentState:
         message_ids = self.get_agent_by_id(agent_id=agent_id, actor=actor).message_ids
+        # TODO: How do we know this?
         new_messages = [message_ids[0]]  # 0 is system message
-        return self.set_in_context_messages(agent_id=agent_id, message_ids=new_messages, actor=actor)
+        return self._set_in_context_messages(agent_id=agent_id, message_ids=new_messages, actor=actor)
 
     @enforce_types
     def prepend_to_in_context_messages(self, messages: List[PydanticMessage], agent_id: str, actor: PydanticUser) -> PydanticAgentState:
         message_ids = self.get_agent_by_id(agent_id=agent_id, actor=actor).message_ids
         new_messages = self.message_manager.create_many_messages(messages, actor=actor)
         message_ids = [message_ids[0]] + [m.id for m in new_messages] + message_ids[1:]
-        return self.set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
+        return self._set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
 
     @enforce_types
     def append_to_in_context_messages(self, messages: List[PydanticMessage], agent_id: str, actor: PydanticUser) -> PydanticAgentState:
         messages = self.message_manager.create_many_messages(messages, actor=actor)
         message_ids = self.get_agent_by_id(agent_id=agent_id, actor=actor).message_ids or []
         message_ids += [m.id for m in messages]
-        return self.set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
+        return self._set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
 
     @enforce_types
     def reset_messages(self, agent_id: str, actor: PydanticUser, add_default_initial_messages: bool = False) -> PydanticAgentState:

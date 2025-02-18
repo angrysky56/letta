@@ -111,7 +111,6 @@ def create(
     # streaming?
     stream: bool = False,
     stream_interface: Optional[Union[AgentRefreshStreamingInterface, AgentChunkStreamingInterface]] = None,
-    max_tokens: Optional[int] = None,
     model_settings: Optional[dict] = None,  # TODO: eventually pass from server
 ) -> ChatCompletionResponse:
     """Return response to chat completion with backoff"""
@@ -152,12 +151,13 @@ def create(
         if function_call is None and functions is not None and len(functions) > 0:
             # force function calling for reliability, see https://platform.openai.com/docs/api-reference/chat/create#chat-create-tool_choice
             # TODO(matt) move into LLMConfig
-            if llm_config.model_endpoint == "https://inference.memgpt.ai":
+            # TODO: This vllm checking is very brittle and is a patch at most
+            if llm_config.model_endpoint == "https://inference.memgpt.ai" or (llm_config.handle and "vllm" in llm_config.handle):
                 function_call = "auto"  # TODO change to "required" once proxy supports it
             else:
                 function_call = "required"
 
-        data = build_openai_chat_completions_request(llm_config, messages, user_id, functions, function_call, use_tool_naming, max_tokens)
+        data = build_openai_chat_completions_request(llm_config, messages, user_id, functions, function_call, use_tool_naming)
         if stream:  # Client requested token streaming
             data.stream = True
             assert isinstance(stream_interface, AgentChunkStreamingInterface) or isinstance(
@@ -212,7 +212,7 @@ def create(
         # For Azure, this model_endpoint is required to be configured via env variable, so users don't need to provide it in the LLM config
         llm_config.model_endpoint = model_settings.azure_base_url
         chat_completion_request = build_openai_chat_completions_request(
-            llm_config, messages, user_id, functions, function_call, use_tool_naming, max_tokens
+            llm_config, messages, user_id, functions, function_call, use_tool_naming
         )
 
         response = azure_openai_chat_completions_request(
@@ -248,8 +248,34 @@ def create(
             data=dict(
                 contents=[m.to_google_ai_dict() for m in messages],
                 tools=tools,
-                generation_config={"temperature": llm_config.temperature},
+                generation_config={"temperature": llm_config.temperature, "max_output_tokens": llm_config.max_tokens},
             ),
+            inner_thoughts_in_kwargs=llm_config.put_inner_thoughts_in_kwargs,
+        )
+
+    elif llm_config.model_endpoint_type == "google_vertex":
+        from letta.llm_api.google_vertex import google_vertex_chat_completions_request
+
+        if stream:
+            raise NotImplementedError(f"Streaming not yet implemented for {llm_config.model_endpoint_type}")
+        if not use_tool_naming:
+            raise NotImplementedError("Only tool calling supported on Google Vertex AI API requests")
+
+        if functions is not None:
+            tools = [{"type": "function", "function": f} for f in functions]
+            tools = [Tool(**t) for t in tools]
+            tools = convert_tools_to_google_ai_format(tools, inner_thoughts_in_kwargs=llm_config.put_inner_thoughts_in_kwargs)
+        else:
+            tools = None
+
+        config = {"tools": tools, "temperature": llm_config.temperature, "max_output_tokens": llm_config.max_tokens}
+
+        return google_vertex_chat_completions_request(
+            model=llm_config.model,
+            project_id=model_settings.google_cloud_project,
+            region=model_settings.google_cloud_location,
+            contents=[m.to_google_ai_dict() for m in messages],
+            config=config,
             inner_thoughts_in_kwargs=llm_config.put_inner_thoughts_in_kwargs,
         )
 
@@ -268,7 +294,7 @@ def create(
             messages=[cast_message_to_subtype(m.to_openai_dict()) for m in messages],
             tools=([{"type": "function", "function": f} for f in functions] if functions else None),
             tool_choice=tool_call,
-            max_tokens=1024,  # TODO make dynamic
+            max_tokens=llm_config.max_tokens,  # Note: max_tokens is required for Anthropic API
             temperature=llm_config.temperature,
             stream=stream,
         )
@@ -279,14 +305,21 @@ def create(
 
             response = anthropic_chat_completions_process_stream(
                 chat_completion_request=chat_completion_request,
+                put_inner_thoughts_in_kwargs=llm_config.put_inner_thoughts_in_kwargs,
                 stream_interface=stream_interface,
             )
-            return response
 
-        # Client did not request token streaming (expect a blocking backend response)
-        return anthropic_chat_completions_request(
-            data=chat_completion_request,
-        )
+        else:
+            # Client did not request token streaming (expect a blocking backend response)
+            response = anthropic_chat_completions_request(
+                data=chat_completion_request,
+                put_inner_thoughts_in_kwargs=llm_config.put_inner_thoughts_in_kwargs,
+            )
+
+        if llm_config.put_inner_thoughts_in_kwargs:
+            response = unpack_all_inner_thoughts_from_kwargs(response=response, inner_thoughts_key=INNER_THOUGHTS_KWARG)
+
+        return response
 
     # elif llm_config.model_endpoint_type == "cohere":
     #     if stream:
@@ -416,7 +449,7 @@ def create(
                 tool_choice=tool_call,
                 # user=str(user_id),
                 # NOTE: max_tokens is required for Anthropic API
-                max_tokens=1024,  # TODO make dynamic
+                max_tokens=llm_config.max_tokens,
             ),
         )
 

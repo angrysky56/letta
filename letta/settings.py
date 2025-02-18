@@ -85,6 +85,11 @@ class ModelSettings(BaseSettings):
 
     # google ai
     gemini_api_key: Optional[str] = None
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/"
+
+    # google vertex
+    google_cloud_project: Optional[str] = None
+    google_cloud_location: Optional[str] = None
 
     # together
     together_api_key: Optional[str] = None
@@ -145,6 +150,14 @@ class Settings(BaseSettings):
     pg_pool_timeout: int = 30  # Seconds to wait for a connection
     pg_pool_recycle: int = 1800  # When to recycle connections
     pg_echo: bool = False  # Logging
+
+    # multi agent settings
+    multi_agent_send_message_max_retries: int = 3
+    multi_agent_send_message_timeout: int = 20 * 60
+    multi_agent_concurrent_sends: int = 15
+
+    # telemetry logging
+    verbose_telemetry_logging: bool = False
 
     @property
     def letta_pg_uri(self) -> str:

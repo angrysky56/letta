@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import AsyncGenerator, Literal, Optional, Union
 
 from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
+from letta.helpers.datetime_helpers import is_utc_datetime
 from letta.interface import AgentInterface
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG
 from letta.schemas.enums import MessageStreamStatus
@@ -25,7 +26,6 @@ from letta.schemas.message import Message
 from letta.schemas.openai.chat_completion_response import ChatCompletionChunkResponse
 from letta.streaming_interface import AgentChunkStreamingInterface
 from letta.streaming_utils import FunctionArgumentsStreamHandler, JSONInnerThoughtsExtractor
-from letta.utils import is_utc_datetime
 
 
 # TODO strip from code / deprecate
@@ -315,7 +315,7 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
 
         # extra prints
         self.debug = False
-        self.timeout = 30
+        self.timeout = 10 * 60  # 10 minute timeout
 
     def _reset_inner_thoughts_json_reader(self):
         # A buffer for accumulating function arguments (we want to buffer keys and run checks on each one)
@@ -330,7 +330,7 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
         while self._active:
             try:
                 # Wait until there is an item in the deque or the stream is deactivated
-                await asyncio.wait_for(self._event.wait(), timeout=self.timeout)  # 30 second timeout
+                await asyncio.wait_for(self._event.wait(), timeout=self.timeout)
             except asyncio.TimeoutError:
                 break  # Exit the loop if we timeout
 
@@ -436,11 +436,15 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
 
         # inner thoughts
         if message_delta.content is not None:
-            processed_chunk = ReasoningMessage(
-                id=message_id,
-                date=message_date,
-                reasoning=message_delta.content,
-            )
+            if message_delta.content == "":
+                print("skipping empty content")
+                processed_chunk = None
+            else:
+                processed_chunk = ReasoningMessage(
+                    id=message_id,
+                    date=message_date,
+                    reasoning=message_delta.content,
+                )
 
         # tool calls
         elif message_delta.tool_calls is not None and len(message_delta.tool_calls) > 0:
@@ -496,15 +500,24 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
                         if tool_call.function.name:
                             tool_call_delta["name"] = tool_call.function.name
 
-                    processed_chunk = ToolCallMessage(
-                        id=message_id,
-                        date=message_date,
-                        tool_call=ToolCallDelta(
-                            name=tool_call_delta.get("name"),
-                            arguments=tool_call_delta.get("arguments"),
-                            tool_call_id=tool_call_delta.get("id"),
-                        ),
-                    )
+                    # We might end up with a no-op, in which case we should omit
+                    if (
+                        tool_call_delta.get("name") is None
+                        and tool_call_delta.get("arguments") in [None, ""]
+                        and tool_call_delta.get("id") is None
+                    ):
+                        processed_chunk = None
+                        print("skipping empty chunk...")
+                    else:
+                        processed_chunk = ToolCallMessage(
+                            id=message_id,
+                            date=message_date,
+                            tool_call=ToolCallDelta(
+                                name=tool_call_delta.get("name"),
+                                arguments=tool_call_delta.get("arguments"),
+                                tool_call_id=tool_call_delta.get("id"),
+                            ),
+                        )
 
             elif self.inner_thoughts_in_kwargs and tool_call.function:
                 processed_chunk = None
@@ -525,11 +538,12 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
                         self.function_id_buffer += tool_call.id
 
                 if tool_call.function.arguments:
-                    if chunk.model.startswith("claude-"):
-                        updates_main_json = tool_call.function.arguments
-                        updates_inner_thoughts = ""
-                    else:  # OpenAI
-                        updates_main_json, updates_inner_thoughts = self.function_args_reader.process_fragment(tool_call.function.arguments)
+                    # if chunk.model.startswith("claude-"):
+                    # updates_main_json = tool_call.function.arguments
+                    # updates_inner_thoughts = ""
+                    # else:  # OpenAI
+                    # updates_main_json, updates_inner_thoughts = self.function_args_reader.process_fragment(tool_call.function.arguments)
+                    updates_main_json, updates_inner_thoughts = self.function_args_reader.process_fragment(tool_call.function.arguments)
 
                     # If we have inner thoughts, we should output them as a chunk
                     if updates_inner_thoughts:
@@ -787,15 +801,24 @@ class StreamingServerInterface(AgentChunkStreamingInterface):
                     if tool_call.function.name:
                         tool_call_delta["name"] = tool_call.function.name
 
-                processed_chunk = ToolCallMessage(
-                    id=message_id,
-                    date=message_date,
-                    tool_call=ToolCallDelta(
-                        name=tool_call_delta.get("name"),
-                        arguments=tool_call_delta.get("arguments"),
-                        tool_call_id=tool_call_delta.get("id"),
-                    ),
-                )
+                # We might end up with a no-op, in which case we should omit
+                if (
+                    tool_call_delta.get("name") is None
+                    and tool_call_delta.get("arguments") in [None, ""]
+                    and tool_call_delta.get("id") is None
+                ):
+                    processed_chunk = None
+                    print("skipping empty chunk...")
+                else:
+                    processed_chunk = ToolCallMessage(
+                        id=message_id,
+                        date=message_date,
+                        tool_call=ToolCallDelta(
+                            name=tool_call_delta.get("name"),
+                            arguments=tool_call_delta.get("arguments"),
+                            tool_call_id=tool_call_delta.get("id"),
+                        ),
+                    )
 
         elif choice.finish_reason is not None:
             # skip if there's a finish

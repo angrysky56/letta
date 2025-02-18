@@ -186,7 +186,7 @@ def test_check_tool_rules_with_different_models(mock_e2b_api_key_none):
     client = create_client()
 
     config_files = [
-        "tests/configs/llm_model_configs/claude-3-sonnet-20240229.json",
+        "tests/configs/llm_model_configs/claude-3-5-sonnet.json",
         "tests/configs/llm_model_configs/openai-gpt-3.5-turbo.json",
         "tests/configs/llm_model_configs/openai-gpt-4o.json",
     ]
@@ -247,7 +247,7 @@ def test_claude_initial_tool_rule_enforced(mock_e2b_api_key_none):
     tools = [t1, t2]
 
     # Make agent state
-    anthropic_config_file = "tests/configs/llm_model_configs/claude-3-sonnet-20240229.json"
+    anthropic_config_file = "tests/configs/llm_model_configs/claude-3-5-sonnet.json"
     for i in range(3):
         agent_uuid = str(uuid.uuid4())
         agent_state = setup_agent(
@@ -299,7 +299,7 @@ def test_agent_no_structured_output_with_one_child_tool(mock_e2b_api_key_none):
     tools = [send_message, archival_memory_search, archival_memory_insert]
 
     config_files = [
-        "tests/configs/llm_model_configs/claude-3-sonnet-20240229.json",
+        "tests/configs/llm_model_configs/claude-3-5-sonnet.json",
         "tests/configs/llm_model_configs/openai-gpt-4o.json",
     ]
 
@@ -383,7 +383,7 @@ def test_agent_conditional_tool_easy(mock_e2b_api_key_none):
     ]
     tools = [flip_coin_tool, reveal_secret]
 
-    config_file = "tests/configs/llm_model_configs/claude-3-sonnet-20240229.json"
+    config_file = "tests/configs/llm_model_configs/claude-3-5-sonnet.json"
     agent_state = setup_agent(client, config_file, agent_uuid=agent_uuid, tool_ids=[t.id for t in tools], tool_rules=tool_rules)
     response = client.user_message(agent_id=agent_state.id, message="flip a coin until you get the secret word")
 
@@ -455,7 +455,7 @@ def test_agent_conditional_tool_hard(mock_e2b_api_key_none):
 
     # Setup agent with all tools
     tools = [play_game_tool, flip_coin_tool, reveal_secret]
-    config_file = "tests/configs/llm_model_configs/claude-3-sonnet-20240229.json"
+    config_file = "tests/configs/llm_model_configs/claude-3-5-sonnet.json"
     agent_state = setup_agent(client, config_file, agent_uuid=agent_uuid, tool_ids=[t.id for t in tools], tool_rules=tool_rules)
 
     # Ask agent to try to get all secret words
@@ -659,3 +659,64 @@ def test_simple_tool_rule(mock_e2b_api_key_none):
     assert tool_calls[flip_coin_call_index + 1].tool_call.name == secret_word, "Fourth secret word should be called after flip_coin"
 
     cleanup(client, agent_uuid=agent_state.id)
+
+
+def test_init_tool_rule_always_fails_one_tool():
+    """
+    Test an init tool rule that always fails when called. The agent has only one tool available.
+
+    Once that tool fails and the agent removes that tool, the agent should have 0 tools available.
+
+    This means that the agent should return from `step` early.
+    """
+    client = create_client()
+    cleanup(client=client, agent_uuid=agent_uuid)
+
+    # Create tools
+    bad_tool = client.create_or_update_tool(auto_error)
+
+    # Create tool rule: InitToolRule
+    tool_rule = InitToolRule(
+        tool_name=bad_tool.name,
+    )
+
+    # Set up agent with the tool rule
+    claude_config = "tests/configs/llm_model_configs/claude-3-5-sonnet.json"
+    agent_state = setup_agent(client, claude_config, agent_uuid, tool_rules=[tool_rule], tool_ids=[bad_tool.id], include_base_tools=False)
+
+    # Start conversation
+    response = client.user_message(agent_id=agent_state.id, message="blah blah blah")
+
+    # Verify the tool calls
+    tool_calls = [msg for msg in response.messages if isinstance(msg, ToolCallMessage)]
+    assert len(tool_calls) >= 1  # Should have at least flip_coin and fourth_secret_word calls
+    assert_invoked_function_call(response.messages, bad_tool.name)
+
+
+def test_init_tool_rule_always_fails_multiple_tools():
+    """
+    Test an init tool rule that always fails when called. The agent has only 1+ tools available.
+    Once that tool fails and the agent removes that tool, the agent should have other tools available.
+    """
+    client = create_client()
+    cleanup(client=client, agent_uuid=agent_uuid)
+
+    # Create tools
+    bad_tool = client.create_or_update_tool(auto_error)
+
+    # Create tool rule: InitToolRule
+    tool_rule = InitToolRule(
+        tool_name=bad_tool.name,
+    )
+
+    # Set up agent with the tool rule
+    claude_config = "tests/configs/llm_model_configs/claude-3-5-sonnet.json"
+    agent_state = setup_agent(client, claude_config, agent_uuid, tool_rules=[tool_rule], tool_ids=[bad_tool.id], include_base_tools=True)
+
+    # Start conversation
+    response = client.user_message(agent_id=agent_state.id, message="blah blah blah")
+
+    # Verify the tool calls
+    tool_calls = [msg for msg in response.messages if isinstance(msg, ToolCallMessage)]
+    assert len(tool_calls) >= 1  # Should have at least flip_coin and fourth_secret_word calls
+    assert_invoked_function_call(response.messages, bad_tool.name)
