@@ -94,6 +94,7 @@ def build_openai_chat_completions_request(
     functions: Optional[list],
     function_call: Optional[str],
     use_tool_naming: bool,
+    put_inner_thoughts_first: bool = True,
 ) -> ChatCompletionRequest:
     if functions and llm_config.put_inner_thoughts_in_kwargs:
         # Special case for LM Studio backend since it needs extra guidance to force out the thoughts first
@@ -105,6 +106,7 @@ def build_openai_chat_completions_request(
             functions=functions,
             inner_thoughts_key=INNER_THOUGHTS_KWARG,
             inner_thoughts_description=inner_thoughts_desc,
+            put_inner_thoughts_first=put_inner_thoughts_first,
         )
 
     openai_message_list = [
@@ -166,6 +168,11 @@ def openai_chat_completions_process_stream(
     create_message_id: bool = True,
     create_message_datetime: bool = True,
     override_tool_call_id: bool = True,
+    # if we expect reasoning content in the response,
+    # then we should emit reasoning_content as "inner_thoughts"
+    # however, we don't necessarily want to put these
+    # expect_reasoning_content: bool = False,
+    expect_reasoning_content: bool = True,
 ) -> ChatCompletionResponse:
     """Process a streaming completion response, and return a ChatCompletionRequest at the end.
 
@@ -250,6 +257,7 @@ def openai_chat_completions_process_stream(
                         chat_completion_chunk,
                         message_id=chat_completion_response.id if create_message_id else chat_completion_chunk.id,
                         message_date=chat_completion_response.created if create_message_datetime else chat_completion_chunk.created,
+                        expect_reasoning_content=expect_reasoning_content,
                     )
                 elif isinstance(stream_interface, AgentRefreshStreamingInterface):
                     stream_interface.process_refresh(chat_completion_response)
@@ -289,6 +297,13 @@ def openai_chat_completions_process_stream(
                         accum_message.content = content_delta
                     else:
                         accum_message.content += content_delta
+
+                if expect_reasoning_content and message_delta.reasoning_content is not None:
+                    reasoning_content_delta = message_delta.reasoning_content
+                    if accum_message.reasoning_content is None:
+                        accum_message.reasoning_content = reasoning_content_delta
+                    else:
+                        accum_message.reasoning_content += reasoning_content_delta
 
                 # TODO(charles) make sure this works for parallel tool calling?
                 if message_delta.tool_calls is not None:
@@ -377,7 +392,7 @@ def openai_chat_completions_process_stream(
     chat_completion_response.usage.completion_tokens = n_chunks
     chat_completion_response.usage.total_tokens = prompt_tokens + n_chunks
 
-    assert len(chat_completion_response.choices) > 0, chat_completion_response
+    assert len(chat_completion_response.choices) > 0, f"No response from provider {chat_completion_response}"
 
     # printd(chat_completion_response)
     return chat_completion_response

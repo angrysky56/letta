@@ -16,7 +16,7 @@ class BlockManager:
 
     def __init__(self):
         # Fetching the db_context similarly as in ToolManager
-        from letta.server.server import db_context
+        from letta.server.db import db_context
 
         self.session_maker = db_context
 
@@ -107,12 +107,14 @@ class BlockManager:
     @enforce_types
     def add_default_blocks(self, actor: PydanticUser):
         for persona_file in list_persona_files():
-            text = open(persona_file, "r", encoding="utf-8").read()
+            with open(persona_file, "r", encoding="utf-8") as f:
+                text = f.read()
             name = os.path.basename(persona_file).replace(".txt", "")
             self.create_or_update_block(Persona(template_name=name, value=text, is_template=True), actor=actor)
 
         for human_file in list_human_files():
-            text = open(human_file, "r", encoding="utf-8").read()
+            with open(human_file, "r", encoding="utf-8") as f:
+                text = f.read()
             name = os.path.basename(human_file).replace(".txt", "")
             self.create_or_update_block(Human(template_name=name, value=text, is_template=True), actor=actor)
 

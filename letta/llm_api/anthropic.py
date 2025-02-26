@@ -47,14 +47,39 @@ BASE_URL = "https://api.anthropic.com/v1"
 # https://docs.anthropic.com/claude/docs/models-overview
 # Sadly hardcoded
 MODEL_LIST = [
+    ## Opus
     {
         "name": "claude-3-opus-20240229",
         "context_window": 200000,
     },
+    ## Sonnet
+    # 3.0
+    {
+        "name": "claude-3-sonnet-20240229",
+        "context_window": 200000,
+    },
+    # 3.5
+    {
+        "name": "claude-3-5-sonnet-20240620",
+        "context_window": 200000,
+    },
+    # 3.5 new
     {
         "name": "claude-3-5-sonnet-20241022",
         "context_window": 200000,
     },
+    # 3.7
+    {
+        "name": "claude-3-7-sonnet-20250219",
+        "context_window": 200000,
+    },
+    ## Haiku
+    # 3.0
+    {
+        "name": "claude-3-haiku-20240307",
+        "context_window": 200000,
+    },
+    # 3.5
     {
         "name": "claude-3-5-haiku-20241022",
         "context_window": 200000,
@@ -75,7 +100,18 @@ def anthropic_get_model_list(url: str, api_key: Union[str, None]) -> dict:
     """https://docs.anthropic.com/claude/docs/models-overview"""
 
     # NOTE: currently there is no GET /models, so we need to hardcode
-    return MODEL_LIST
+    # return MODEL_LIST
+
+    anthropic_override_key = ProviderManager().get_anthropic_override_key()
+    if anthropic_override_key:
+        anthropic_client = anthropic.Anthropic(api_key=anthropic_override_key)
+    elif model_settings.anthropic_api_key:
+        anthropic_client = anthropic.Anthropic()
+
+    models = anthropic_client.models.list()
+    models_json = models.model_dump()
+    assert "data" in models_json, f"Anthropic model query response missing 'data' field: {models_json}"
+    return models_json["data"]
 
 
 def convert_tools_to_anthropic_format(tools: List[Tool]) -> List[dict]:
@@ -519,6 +555,7 @@ def _prepare_anthropic_request(
     prefix_fill: bool = True,
     # if true, put COT inside the tool calls instead of inside the content
     put_inner_thoughts_in_kwargs: bool = False,
+    bedrock: bool = False,
 ) -> dict:
     """Prepare the request data for Anthropic API format."""
 
@@ -606,10 +643,11 @@ def _prepare_anthropic_request(
     # NOTE: cannot prefill with tools for opus:
     # Your API request included an `assistant` message in the final position, which would pre-fill the `assistant` response. When using tools with "claude-3-opus-20240229"
     if prefix_fill and not put_inner_thoughts_in_kwargs and "opus" not in data["model"]:
-        data["messages"].append(
-            # Start the thinking process for the assistant
-            {"role": "assistant", "content": f"<{inner_thoughts_xml_tag}>"},
-        )
+        if not bedrock:  # not support for bedrock
+            data["messages"].append(
+                # Start the thinking process for the assistant
+                {"role": "assistant", "content": f"<{inner_thoughts_xml_tag}>"},
+            )
 
     # Validate max_tokens
     assert "max_tokens" in data, data
@@ -651,13 +689,16 @@ def anthropic_bedrock_chat_completions_request(
     inner_thoughts_xml_tag: Optional[str] = "thinking",
 ) -> ChatCompletionResponse:
     """Make a chat completion request to Anthropic via AWS Bedrock."""
-    data = _prepare_anthropic_request(data, inner_thoughts_xml_tag)
+    data = _prepare_anthropic_request(data, inner_thoughts_xml_tag, bedrock=True)
 
     # Get the client
     client = get_bedrock_client()
 
     # Make the request
     try:
+        # bedrock does not support certain args
+        data["tool_choice"] = {"type": "any"}
+
         response = client.messages.create(**data)
         return convert_anthropic_response_to_chatcompletion(response=response, inner_thoughts_xml_tag=inner_thoughts_xml_tag)
     except PermissionDeniedError:
