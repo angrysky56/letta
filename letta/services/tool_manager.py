@@ -42,7 +42,7 @@ class ToolManager:
         tool = self.get_tool_by_name(tool_name=pydantic_tool.name, actor=actor)
         if tool:
             # Put to dict and remove fields that should not be reset
-            update_data = pydantic_tool.model_dump(to_orm=True, exclude_unset=True, exclude_none=True)
+            update_data = pydantic_tool.model_dump(exclude_unset=True, exclude_none=True)
 
             # If there's anything to update
             if update_data:
@@ -55,6 +55,12 @@ class ToolManager:
             tool = self.create_tool(pydantic_tool, actor=actor)
 
         return tool
+
+    @enforce_types
+    def create_or_update_mcp_tool(self, tool_create: ToolCreate, actor: PydanticUser) -> PydanticTool:
+        return self.create_or_update_tool(
+            PydanticTool(tool_type=ToolType.EXTERNAL_MCP, name=tool_create.json_schema["name"], **tool_create.model_dump()), actor
+        )
 
     @enforce_types
     def create_or_update_composio_tool(self, tool_create: ToolCreate, actor: PydanticUser) -> PydanticTool:

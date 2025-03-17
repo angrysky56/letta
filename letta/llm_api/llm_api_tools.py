@@ -120,7 +120,7 @@ def retry_with_exponential_backoff(
     return wrapper
 
 
-@trace_method("LLM Request")
+@trace_method
 @retry_with_exponential_backoff
 def create(
     # agent_state: AgentState,
@@ -596,7 +596,6 @@ def create(
             messages[0].content[
                 0
             ].text += f'Select best function to call simply by responding with a single json block with the keys "function" and "params". Use double quotes around the arguments.'
-
         return get_chat_completion(
             model=llm_config.model,
             messages=messages,

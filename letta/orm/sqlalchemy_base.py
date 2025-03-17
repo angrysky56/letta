@@ -69,7 +69,7 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
         join_model: Optional[Base] = None,
         join_conditions: Optional[Union[Tuple, List]] = None,
         identifier_keys: Optional[List[str]] = None,
-        identifier_id: Optional[str] = None,
+        identity_id: Optional[str] = None,
         **kwargs,
     ) -> List["SqlalchemyBase"]:
         """
@@ -139,18 +139,18 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
                 else:
                     # Match ANY tag - use join and filter
                     query = (
-                        query.join(cls.tags).filter(cls.tags.property.mapper.class_.tag.in_(tags)).group_by(cls.id)
+                        query.join(cls.tags).filter(cls.tags.property.mapper.class_.tag.in_(tags)).distinct(cls.id).order_by(cls.id)
                     )  # Deduplicate results
 
-                # Group by primary key and all necessary columns to avoid JSON comparison
-                query = query.group_by(cls.id)
+                # select distinct primary key
+                query = query.distinct(cls.id).order_by(cls.id)
 
             if identifier_keys and hasattr(cls, "identities"):
                 query = query.join(cls.identities).filter(cls.identities.property.mapper.class_.identifier_key.in_(identifier_keys))
 
-            # given the identifier_id, we can find within the agents table any agents that have the identifier_id in their identity_ids
-            if identifier_id and hasattr(cls, "identities"):
-                query = query.join(cls.identities).filter(cls.identities.property.mapper.class_.id == identifier_id)
+            # given the identity_id, we can find within the agents table any agents that have the identity_id in their identity_ids
+            if identity_id and hasattr(cls, "identities"):
+                query = query.join(cls.identities).filter(cls.identities.property.mapper.class_.id == identity_id)
 
             # Apply filtering logic from kwargs
             for key, value in kwargs.items():
