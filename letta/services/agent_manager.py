@@ -349,6 +349,7 @@ class AgentManager:
         identity_id: Optional[str] = None,
         identifier_keys: Optional[List[str]] = None,
         include_relationships: Optional[List[str]] = None,
+        ascending: bool = True,
     ) -> List[PydanticAgentState]:
         """
         Retrieves agents with optimized filtering and optional field selection.
@@ -368,6 +369,7 @@ class AgentManager:
             identity_id (Optional[str]): Filter by identifier ID.
             identifier_keys (Optional[List[str]]): Search agents by identifier keys.
             include_relationships (Optional[List[str]]): List of fields to load for performance optimization.
+            ascending
 
         Returns:
             List[PydanticAgentState]: The filtered list of matching agents.
@@ -380,7 +382,7 @@ class AgentManager:
             query = _apply_filters(query, name, query_text, project_id, template_id, base_template_id)
             query = _apply_identity_filters(query, identity_id, identifier_keys)
             query = _apply_tag_filter(query, tags, match_all_tags)
-            query = _apply_pagination(query, before, after, session)
+            query = _apply_pagination(query, before, after, session, ascending=ascending)
 
             query = query.limit(limit)
 
@@ -639,7 +641,7 @@ class AgentManager:
 
         diff = united_diff(curr_system_message_openai["content"], new_system_message_str)
         if len(diff) > 0:  # there was a diff
-            logger.info(f"Rebuilding system with new memory...\nDiff:\n{diff}")
+            logger.debug(f"Rebuilding system with new memory...\nDiff:\n{diff}")
 
             # Swap the system message out (only if there is a diff)
             message = PydanticMessage.dict_to_message(
@@ -742,6 +744,8 @@ class AgentManager:
         Update internal memory object and system prompt if there have been modifications.
 
         Args:
+            actor:
+            agent_id:
             new_memory (Memory): the new memory object to compare to the current memory object
 
         Returns:
@@ -755,7 +759,7 @@ class AgentManager:
                 if updated_value != agent_state.memory.get_block(label).value:
                     # update the block if it's changed
                     block_id = agent_state.memory.get_block(label).id
-                    block = self.block_manager.update_block(block_id=block_id, block_update=BlockUpdate(value=updated_value), actor=actor)
+                    self.block_manager.update_block(block_id=block_id, block_update=BlockUpdate(value=updated_value), actor=actor)
 
             # refresh memory from DB (using block ids)
             agent_state.memory = Memory(
@@ -767,6 +771,13 @@ class AgentManager:
             # TODO: pass in update timestamp from block edit time
             agent_state = self.rebuild_system_prompt(agent_id=agent_id, actor=actor)
 
+        return agent_state
+
+    @enforce_types
+    def refresh_memory(self, agent_state: PydanticAgentState, actor: PydanticUser) -> PydanticAgentState:
+        agent_state.memory.blocks = self.block_manager.get_all_blocks_by_ids(
+            block_ids=[b.id for b in agent_state.memory.blocks], actor=actor
+        )
         return agent_state
 
     # ======================================================================================================================

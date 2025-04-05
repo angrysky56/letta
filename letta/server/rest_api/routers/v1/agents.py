@@ -9,6 +9,7 @@ from marshmallow import ValidationError
 from pydantic import Field
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from letta.agents.letta_agent import LettaAgent
 from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
 from letta.log import get_logger
 from letta.orm.errors import NoResultFound
@@ -19,6 +20,8 @@ from letta.schemas.letta_message import LettaMessageUnion, LettaMessageUpdateUni
 from letta.schemas.letta_request import LettaRequest, LettaStreamingRequest
 from letta.schemas.letta_response import LettaResponse
 from letta.schemas.memory import ContextWindowOverview, CreateArchivalMemory, Memory
+from letta.schemas.message import MessageCreate
+from letta.schemas.openai.chat_completion_request import UserMessage
 from letta.schemas.passage import Passage, PassageUpdate
 from letta.schemas.run import Run
 from letta.schemas.source import Source
@@ -27,6 +30,7 @@ from letta.schemas.user import User
 from letta.serialize_schemas.pydantic_agent_schema import AgentSchema
 from letta.server.rest_api.utils import get_letta_server
 from letta.server.server import SyncServer
+from letta.settings import settings
 
 # These can be forward refs, but because Fastapi needs them at runtime the must be imported normally
 
@@ -63,6 +67,10 @@ def list_agents(
             "Using this can optimize performance by reducing unnecessary joins."
         ),
     ),
+    ascending: bool = Query(
+        False,
+        description="Whether to sort agents oldest to newest (True) or newest to oldest (False, default)",
+    ),
 ):
     """
     List all agents associated with a given user.
@@ -90,6 +98,7 @@ def list_agents(
         identity_id=identity_id,
         identifier_keys=identifier_keys,
         include_relationships=include_relationships,
+        ascending=ascending,
     )
 
 
@@ -210,7 +219,7 @@ def modify_agent(
 ):
     """Update an existing agent"""
     actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    return server.agent_manager.update_agent(agent_id=agent_id, agent_update=update_agent, actor=actor)
+    return server.update_agent(agent_id=agent_id, request=update_agent, actor=actor)
 
 
 @router.get("/{agent_id}/tools", response_model=List[Tool], operation_id="list_agent_tools")
@@ -432,9 +441,13 @@ def detach_block(
 def list_passages(
     agent_id: str,
     server: "SyncServer" = Depends(get_letta_server),
-    after: Optional[int] = Query(None, description="Unique ID of the memory to start the query range at."),
-    before: Optional[int] = Query(None, description="Unique ID of the memory to end the query range at."),
+    after: Optional[str] = Query(None, description="Unique ID of the memory to start the query range at."),
+    before: Optional[str] = Query(None, description="Unique ID of the memory to end the query range at."),
     limit: Optional[int] = Query(None, description="How many results to include in the response."),
+    search: Optional[str] = Query(None, description="Search passages by text"),
+    ascending: Optional[bool] = Query(
+        True, description="Whether to sort passages oldest to newest (True, default) or newest to oldest (False)"
+    ),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
 ):
     """
@@ -447,7 +460,9 @@ def list_passages(
         agent_id=agent_id,
         after=after,
         before=before,
+        query_text=search,
         limit=limit,
+        ascending=ascending,
     )
 
 
@@ -512,6 +527,7 @@ def list_messages(
     after: Optional[str] = Query(None, description="Message after which to retrieve the returned messages."),
     before: Optional[str] = Query(None, description="Message before which to retrieve the returned messages."),
     limit: int = Query(10, description="Maximum number of messages to retrieve."),
+    group_id: Optional[str] = Query(None, description="Group ID to filter messages by."),
     use_assistant_message: bool = Query(True, description="Whether to use assistant messages"),
     assistant_message_tool_name: str = Query(DEFAULT_MESSAGE_TOOL, description="The name of the designated message tool."),
     assistant_message_tool_kwarg: str = Query(DEFAULT_MESSAGE_TOOL_KWARG, description="The name of the message argument."),
@@ -528,6 +544,7 @@ def list_messages(
         after=after,
         before=before,
         limit=limit,
+        group_id=group_id,
         reverse=True,
         return_message_object=False,
         use_assistant_message=use_assistant_message,
@@ -568,17 +585,32 @@ async def send_message(
     This endpoint accepts a message from a user and processes it through the agent.
     """
     actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    result = await server.send_message_to_agent(
-        agent_id=agent_id,
-        actor=actor,
-        messages=request.messages,
-        stream_steps=False,
-        stream_tokens=False,
-        # Support for AssistantMessage
-        use_assistant_message=request.use_assistant_message,
-        assistant_message_tool_name=request.assistant_message_tool_name,
-        assistant_message_tool_kwarg=request.assistant_message_tool_kwarg,
-    )
+    if settings.use_experimental:
+        logger.warning("USING EXPERIMENTAL!")
+        experimental_agent = LettaAgent(
+            agent_id=agent_id,
+            message_manager=server.message_manager,
+            agent_manager=server.agent_manager,
+            block_manager=server.block_manager,
+            passage_manager=server.passage_manager,
+            actor=actor,
+        )
+
+        messages = request.messages
+        content = messages[0].content[0].text if messages and not isinstance(messages[0].content, str) else messages[0].content
+        result = await experimental_agent.step(UserMessage(content=content), max_steps=10)
+    else:
+        result = await server.send_message_to_agent(
+            agent_id=agent_id,
+            actor=actor,
+            messages=request.messages,
+            stream_steps=False,
+            stream_tokens=False,
+            # Support for AssistantMessage
+            use_assistant_message=request.use_assistant_message,
+            assistant_message_tool_name=request.assistant_message_tool_name,
+            assistant_message_tool_kwarg=request.assistant_message_tool_kwarg,
+        )
     return result
 
 
@@ -626,7 +658,7 @@ async def process_message_background(
     server: SyncServer,
     actor: User,
     agent_id: str,
-    messages: list,
+    messages: List[MessageCreate],
     use_assistant_message: bool,
     assistant_message_tool_name: str,
     assistant_message_tool_kwarg: str,
@@ -634,23 +666,36 @@ async def process_message_background(
     """Background task to process the message and update job status."""
     try:
         # TODO(matt) we should probably make this stream_steps and log each step as it progresses, so the job update GET can see the total steps so far + partial usage?
-        result = await server.send_message_to_agent(
-            agent_id=agent_id,
-            actor=actor,
-            messages=messages,
-            stream_steps=False,  # NOTE(matt)
-            stream_tokens=False,
-            use_assistant_message=use_assistant_message,
-            assistant_message_tool_name=assistant_message_tool_name,
-            assistant_message_tool_kwarg=assistant_message_tool_kwarg,
-            metadata={"job_id": job_id},  # Pass job_id through metadata
-        )
+        if settings.use_experimental:
+            logger.warning("USING EXPERIMENTAL!")
+            experimental_agent = LettaAgent(
+                agent_id=agent_id,
+                message_manager=server.message_manager,
+                agent_manager=server.agent_manager,
+                block_manager=server.block_manager,
+                passage_manager=server.passage_manager,
+                actor=actor,
+            )
+            content = messages[0].content[0].text if messages and not isinstance(messages[0].content, str) else messages[0].content
+            result = await experimental_agent.step(UserMessage(content=content), max_steps=10)
+        else:
+            result = await server.send_message_to_agent(
+                agent_id=agent_id,
+                actor=actor,
+                messages=messages,
+                stream_steps=False,  # NOTE(matt)
+                stream_tokens=False,
+                use_assistant_message=use_assistant_message,
+                assistant_message_tool_name=assistant_message_tool_name,
+                assistant_message_tool_kwarg=assistant_message_tool_kwarg,
+                metadata={"job_id": job_id},  # Pass job_id through metadata
+            )
 
         # Update job status to completed
         job_update = JobUpdate(
             status=JobStatus.completed,
             completed_at=datetime.utcnow(),
-            metadata={"result": result.model_dump()},  # Store the result in metadata
+            metadata={"result": result.model_dump(mode="json")},  # Store the result in metadata
         )
         server.job_manager.update_job_by_id(job_id=job_id, job_update=job_update, actor=actor)
 

@@ -1,4 +1,6 @@
 import os
+import random
+import string
 import time
 from datetime import datetime, timedelta
 
@@ -8,9 +10,10 @@ from openai.types.chat.chat_completion_message_tool_call import Function as Open
 from sqlalchemy.exc import IntegrityError
 
 from letta.config import LettaConfig
-from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS, LETTA_TOOL_EXECUTION_DIR, MULTI_AGENT_TOOLS
+from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS, LETTA_TOOL_EXECUTION_DIR, MCP_TOOL_TAG_NAME_PREFIX, MULTI_AGENT_TOOLS
 from letta.embeddings import embedding_model
 from letta.functions.functions import derive_openai_json_schema, parse_source_code
+from letta.functions.mcp_client.types import MCPTool
 from letta.orm import Base
 from letta.orm.enums import JobType, ToolType
 from letta.orm.errors import NoResultFound, UniqueConstraintViolationError
@@ -30,7 +33,9 @@ from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message as PydanticMessage
 from letta.schemas.message import MessageCreate, MessageUpdate
 from letta.schemas.openai.chat_completion_response import UsageStatistics
+from letta.schemas.organization import Organization
 from letta.schemas.organization import Organization as PydanticOrganization
+from letta.schemas.organization import OrganizationUpdate
 from letta.schemas.passage import Passage as PydanticPassage
 from letta.schemas.run import Run as PydanticRun
 from letta.schemas.sandbox_config import E2BSandboxConfig, LocalSandboxConfig, SandboxConfigCreate, SandboxConfigUpdate, SandboxType
@@ -79,6 +84,13 @@ def default_organization(server: SyncServer):
 
 
 @pytest.fixture
+def other_organization(server: SyncServer):
+    """Fixture to create and return the default organization."""
+    org = server.organization_manager.create_organization(pydantic_org=Organization(name="letta"))
+    yield org
+
+
+@pytest.fixture
 def default_user(server: SyncServer, default_organization):
     """Fixture to create and return the default user within the default organization."""
     user = server.user_manager.create_default_user(org_id=default_organization.id)
@@ -89,6 +101,13 @@ def default_user(server: SyncServer, default_organization):
 def other_user(server: SyncServer, default_organization):
     """Fixture to create and return the default user within the default organization."""
     user = server.user_manager.create_user(PydanticUser(name="other", organization_id=default_organization.id))
+    yield user
+
+
+@pytest.fixture
+def other_user_different_org(server: SyncServer, other_organization):
+    """Fixture to create and return the default user within the default organization."""
+    user = server.user_manager.create_user(PydanticUser(name="other", organization_id=other_organization.id))
     yield user
 
 
@@ -145,8 +164,9 @@ def print_tool(server: SyncServer, default_user, default_organization):
     source_type = "python"
     description = "test_description"
     tags = ["test"]
+    metadata = {"a": "b"}
 
-    tool = PydanticTool(description=description, tags=tags, source_code=source_code, source_type=source_type)
+    tool = PydanticTool(description=description, tags=tags, source_code=source_code, source_type=source_type, metadata_=metadata)
     derived_json_schema = derive_openai_json_schema(source_code=tool.source_code, name=tool.name)
 
     derived_name = derived_json_schema["name"]
@@ -163,6 +183,30 @@ def print_tool(server: SyncServer, default_user, default_organization):
 def composio_github_star_tool(server, default_user):
     tool_create = ToolCreate.from_composio(action_name="GITHUB_STAR_A_REPOSITORY_FOR_THE_AUTHENTICATED_USER")
     tool = server.tool_manager.create_or_update_composio_tool(tool_create=tool_create, actor=default_user)
+    yield tool
+
+
+@pytest.fixture
+def mcp_tool(server, default_user):
+    mcp_tool = MCPTool(
+        name="weather_lookup",
+        description="Fetches the current weather for a given location.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "The name of the city or location."},
+                "units": {
+                    "type": "string",
+                    "enum": ["metric", "imperial"],
+                    "description": "The unit system for temperature (metric or imperial).",
+                },
+            },
+            "required": ["location"],
+        },
+    )
+    mcp_server_name = "test"
+    tool_create = ToolCreate.from_mcp(mcp_server_name=mcp_server_name, mcp_tool=mcp_tool)
+    tool = server.tool_manager.create_or_update_mcp_tool(tool_create=tool_create, mcp_server_name=mcp_server_name, actor=default_user)
     yield tool
 
 
@@ -711,6 +755,124 @@ def test_list_agents_select_fields_mixed(server: SyncServer, comprehensive_test_
     # Since "invalid_field" is not recognized, it should have no adverse effect.
     # You might optionally check that no extra attribute is created on the pydantic model.
     assert not hasattr(agent, "invalid_field")
+
+
+def test_list_agents_ascending(server: SyncServer, default_user):
+    # Create two agents with known names
+    agent1 = server.agent_manager.create_agent(
+        agent_create=CreateAgent(
+            name="agent_oldest",
+            llm_config=LLMConfig.default_config("gpt-4"),
+            embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            memory_blocks=[],
+        ),
+        actor=default_user,
+    )
+
+    if USING_SQLITE:
+        time.sleep(CREATE_DELAY_SQLITE)
+
+    agent2 = server.agent_manager.create_agent(
+        agent_create=CreateAgent(
+            name="agent_newest",
+            llm_config=LLMConfig.default_config("gpt-4"),
+            embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            memory_blocks=[],
+        ),
+        actor=default_user,
+    )
+
+    agents = server.agent_manager.list_agents(actor=default_user, ascending=True)
+    names = [agent.name for agent in agents]
+    assert names.index("agent_oldest") < names.index("agent_newest")
+
+
+def test_list_agents_descending(server: SyncServer, default_user):
+    # Create two agents with known names
+    agent1 = server.agent_manager.create_agent(
+        agent_create=CreateAgent(
+            name="agent_oldest",
+            llm_config=LLMConfig.default_config("gpt-4"),
+            embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            memory_blocks=[],
+        ),
+        actor=default_user,
+    )
+
+    if USING_SQLITE:
+        time.sleep(CREATE_DELAY_SQLITE)
+
+    agent2 = server.agent_manager.create_agent(
+        agent_create=CreateAgent(
+            name="agent_newest",
+            llm_config=LLMConfig.default_config("gpt-4"),
+            embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            memory_blocks=[],
+        ),
+        actor=default_user,
+    )
+
+    agents = server.agent_manager.list_agents(actor=default_user, ascending=False)
+    names = [agent.name for agent in agents]
+    assert names.index("agent_newest") < names.index("agent_oldest")
+
+
+def test_list_agents_ordering_and_pagination(server: SyncServer, default_user):
+    names = ["alpha_agent", "beta_agent", "gamma_agent"]
+    created_agents = []
+
+    # Create agents in known order
+    for name in names:
+        agent = server.agent_manager.create_agent(
+            agent_create=CreateAgent(
+                name=name,
+                memory_blocks=[],
+                llm_config=LLMConfig.default_config("gpt-4"),
+                embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            ),
+            actor=default_user,
+        )
+        created_agents.append(agent)
+        if USING_SQLITE:
+            time.sleep(CREATE_DELAY_SQLITE)
+
+    agent_ids = {agent.name: agent.id for agent in created_agents}
+
+    # Ascending (oldest to newest)
+    agents_asc = server.agent_manager.list_agents(actor=default_user, ascending=True)
+    asc_names = [agent.name for agent in agents_asc]
+    assert asc_names.index("alpha_agent") < asc_names.index("beta_agent") < asc_names.index("gamma_agent")
+
+    # Descending (newest to oldest)
+    agents_desc = server.agent_manager.list_agents(actor=default_user, ascending=False)
+    desc_names = [agent.name for agent in agents_desc]
+    assert desc_names.index("gamma_agent") < desc_names.index("beta_agent") < desc_names.index("alpha_agent")
+
+    # After: Get agents after alpha_agent in ascending order (should exclude alpha)
+    after_alpha = server.agent_manager.list_agents(actor=default_user, after=agent_ids["alpha_agent"], ascending=True)
+    after_names = [a.name for a in after_alpha]
+    assert "alpha_agent" not in after_names
+    assert "beta_agent" in after_names
+    assert "gamma_agent" in after_names
+    assert after_names == ["beta_agent", "gamma_agent"]
+
+    # Before: Get agents before gamma_agent in ascending order (should exclude gamma)
+    before_gamma = server.agent_manager.list_agents(actor=default_user, before=agent_ids["gamma_agent"], ascending=True)
+    before_names = [a.name for a in before_gamma]
+    assert "gamma_agent" not in before_names
+    assert "alpha_agent" in before_names
+    assert "beta_agent" in before_names
+    assert before_names == ["alpha_agent", "beta_agent"]
+
+    # After: Get agents after gamma_agent in descending order (should exclude gamma, return beta then alpha)
+    after_gamma_desc = server.agent_manager.list_agents(actor=default_user, after=agent_ids["gamma_agent"], ascending=False)
+    after_names_desc = [a.name for a in after_gamma_desc]
+    assert after_names_desc == ["beta_agent", "alpha_agent"]
+
+    # Before: Get agents before alpha_agent in descending order (should exclude alpha)
+    before_alpha_desc = server.agent_manager.list_agents(actor=default_user, before=agent_ids["alpha_agent"], ascending=False)
+    before_names_desc = [a.name for a in before_alpha_desc]
+    assert before_names_desc == ["gamma_agent", "beta_agent"]
 
 
 # ======================================================================================================================
@@ -1644,6 +1806,14 @@ def test_update_organization_name(server: SyncServer):
     assert org.name == org_name_b
 
 
+def test_update_organization_privileged_tools(server: SyncServer):
+    org_name = "test"
+    org = server.organization_manager.create_organization(pydantic_org=PydanticOrganization(name=org_name))
+    assert org.privileged_tools == False
+    org = server.organization_manager.update_organization(org_id=org.id, org_update=OrganizationUpdate(privileged_tools=True))
+    assert org.privileged_tools == True
+
+
 def test_list_organizations_pagination(server: SyncServer):
     server.organization_manager.create_organization(pydantic_org=PydanticOrganization(name="a"))
     server.organization_manager.create_organization(pydantic_org=PydanticOrganization(name="b"))
@@ -1816,6 +1986,14 @@ def test_create_composio_tool(server: SyncServer, composio_github_star_tool, def
     assert composio_github_star_tool.tool_type == ToolType.EXTERNAL_COMPOSIO
 
 
+def test_create_mcp_tool(server: SyncServer, mcp_tool, default_user, default_organization):
+    # Assertions to ensure the created tool matches the expected values
+    assert mcp_tool.created_by_id == default_user.id
+    assert mcp_tool.organization_id == default_organization.id
+    assert mcp_tool.tool_type == ToolType.EXTERNAL_MCP
+    assert mcp_tool.metadata_[MCP_TOOL_TAG_NAME_PREFIX]["server_name"] == "test"
+
+
 @pytest.mark.skipif(USING_SQLITE, reason="Test not applicable when using SQLite.")
 def test_create_tool_duplicate_name(server: SyncServer, print_tool, default_user, default_organization):
     data = print_tool.model_dump(exclude=["id"])
@@ -1834,6 +2012,7 @@ def test_get_tool_by_id(server: SyncServer, print_tool, default_user):
     assert fetched_tool.name == print_tool.name
     assert fetched_tool.description == print_tool.description
     assert fetched_tool.tags == print_tool.tags
+    assert fetched_tool.metadata_ == print_tool.metadata_
     assert fetched_tool.source_code == print_tool.source_code
     assert fetched_tool.source_type == print_tool.source_type
     assert fetched_tool.tool_type == ToolType.CUSTOM
@@ -2234,6 +2413,61 @@ def test_get_blocks(server, default_user):
     persona_blocks = block_manager.get_blocks(actor=default_user, label="persona")
     assert len(persona_blocks) == 1
     assert persona_blocks[0].label == "persona"
+
+
+def test_get_blocks_comprehensive(server, default_user, other_user_different_org):
+    def random_label(prefix="label"):
+        return f"{prefix}_{''.join(random.choices(string.ascii_lowercase, k=6))}"
+
+    def random_value():
+        return "".join(random.choices(string.ascii_letters + string.digits, k=12))
+
+    block_manager = BlockManager()
+
+    # Create 10 blocks for default_user
+    default_user_blocks = []
+    for _ in range(10):
+        label = random_label("default")
+        value = random_value()
+        block_manager.create_or_update_block(PydanticBlock(label=label, value=value), actor=default_user)
+        default_user_blocks.append((label, value))
+
+    # Create 3 blocks for other_user
+    other_user_blocks = []
+    for _ in range(3):
+        label = random_label("other")
+        value = random_value()
+        block_manager.create_or_update_block(PydanticBlock(label=label, value=value), actor=other_user_different_org)
+        other_user_blocks.append((label, value))
+
+    # Check default_user sees only their blocks
+    retrieved_default_blocks = block_manager.get_blocks(actor=default_user)
+    assert len(retrieved_default_blocks) == 10
+    retrieved_labels = {b.label for b in retrieved_default_blocks}
+    for label, value in default_user_blocks:
+        assert label in retrieved_labels
+
+    # Check individual filtering for default_user
+    for label, value in default_user_blocks:
+        filtered = block_manager.get_blocks(actor=default_user, label=label)
+        assert len(filtered) == 1
+        assert filtered[0].label == label
+        assert filtered[0].value == value
+
+    # Check other_user sees only their blocks
+    retrieved_other_blocks = block_manager.get_blocks(actor=other_user_different_org)
+    assert len(retrieved_other_blocks) == 3
+    retrieved_labels = {b.label for b in retrieved_other_blocks}
+    for label, value in other_user_blocks:
+        assert label in retrieved_labels
+
+    # Other user shouldn't see default_user's blocks
+    for label, _ in default_user_blocks:
+        assert block_manager.get_blocks(actor=other_user_different_org, label=label) == []
+
+    # Default user shouldn't see other_user's blocks
+    for label, _ in other_user_blocks:
+        assert block_manager.get_blocks(actor=default_user, label=label) == []
 
 
 def test_update_block(server: SyncServer, default_user):

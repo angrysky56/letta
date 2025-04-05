@@ -58,7 +58,7 @@ from letta.services.message_manager import MessageManager
 from letta.services.passage_manager import PassageManager
 from letta.services.provider_manager import ProviderManager
 from letta.services.step_manager import StepManager
-from letta.services.tool_execution_sandbox import ToolExecutionSandbox
+from letta.services.tool_executor.tool_execution_sandbox import ToolExecutionSandbox
 from letta.services.tool_manager import ToolManager
 from letta.settings import summarizer_settings
 from letta.streaming_interface import StreamingRefreshCLIInterface
@@ -210,107 +210,6 @@ class Agent(BaseAgent):
             return True
         return False
 
-    # TODO: Refactor into separate class v.s. large if/elses here
-    def execute_tool_and_persist_state(
-        self, function_name: str, function_args: dict, target_letta_tool: Tool
-    ) -> tuple[Any, Optional[SandboxRunResult]]:
-        """
-        Execute tool modifications and persist the state of the agent.
-        Note: only some agent state modifications will be persisted, such as data in the AgentState ORM and block data
-        """
-        # TODO: add agent manager here
-        orig_memory_str = self.agent_state.memory.compile()
-
-        # TODO: need to have an AgentState object that actually has full access to the block data
-        # this is because the sandbox tools need to be able to access block.value to edit this data
-        try:
-            if target_letta_tool.tool_type == ToolType.LETTA_CORE:
-                # base tools are allowed to access the `Agent` object and run on the database
-                callable_func = get_function_from_module(LETTA_CORE_TOOL_MODULE_NAME, function_name)
-                function_args["self"] = self  # need to attach self to arg since it's dynamically linked
-                function_response = callable_func(**function_args)
-            elif target_letta_tool.tool_type == ToolType.LETTA_MULTI_AGENT_CORE:
-                callable_func = get_function_from_module(LETTA_MULTI_AGENT_TOOL_MODULE_NAME, function_name)
-                function_args["self"] = self  # need to attach self to arg since it's dynamically linked
-                function_response = callable_func(**function_args)
-            elif target_letta_tool.tool_type == ToolType.LETTA_MEMORY_CORE:
-                callable_func = get_function_from_module(LETTA_CORE_TOOL_MODULE_NAME, function_name)
-                agent_state_copy = self.agent_state.__deepcopy__()
-                function_args["agent_state"] = agent_state_copy  # need to attach self to arg since it's dynamically linked
-                function_response = callable_func(**function_args)
-                self.update_memory_if_changed(agent_state_copy.memory)
-            elif target_letta_tool.tool_type == ToolType.EXTERNAL_COMPOSIO:
-                action_name = generate_composio_action_from_func_name(target_letta_tool.name)
-                # Get entity ID from the agent_state
-                entity_id = None
-                for env_var in self.agent_state.tool_exec_environment_variables:
-                    if env_var.key == COMPOSIO_ENTITY_ENV_VAR_KEY:
-                        entity_id = env_var.value
-                # Get composio_api_key
-                composio_api_key = get_composio_api_key(actor=self.user, logger=self.logger)
-                function_response = execute_composio_action(
-                    action_name=action_name, args=function_args, api_key=composio_api_key, entity_id=entity_id
-                )
-            elif target_letta_tool.tool_type == ToolType.EXTERNAL_MCP:
-                # Get the server name from the tool tag
-                # TODO make a property instead?
-                server_name = target_letta_tool.tags[0].split(":")[1]
-
-                # Get the MCPClient from the server's handle
-                # TODO these don't get raised properly
-                if not self.mcp_clients:
-                    raise ValueError(f"No MCP client available to use")
-                if server_name not in self.mcp_clients:
-                    raise ValueError(f"Unknown MCP server name: {server_name}")
-                mcp_client = self.mcp_clients[server_name]
-                if not isinstance(mcp_client, BaseMCPClient):
-                    raise RuntimeError(f"Expected an MCPClient, but got: {type(mcp_client)}")
-
-                # Check that tool exists
-                available_tools = mcp_client.list_tools()
-                available_tool_names = [t.name for t in available_tools]
-                if function_name not in available_tool_names:
-                    raise ValueError(
-                        f"{function_name} is not available in MCP server {server_name}. Please check your `~/.letta/mcp_config.json` file."
-                    )
-
-                function_response, is_error = mcp_client.execute_tool(tool_name=function_name, tool_args=function_args)
-                sandbox_run_result = SandboxRunResult(status="error" if is_error else "success")
-                return function_response, sandbox_run_result
-            else:
-                try:
-                    # Parse the source code to extract function annotations
-                    annotations = get_function_annotations_from_source(target_letta_tool.source_code, function_name)
-                    # Coerce the function arguments to the correct types based on the annotations
-                    function_args = coerce_dict_args_by_annotations(function_args, annotations)
-                except ValueError as e:
-                    self.logger.debug(f"Error coercing function arguments: {e}")
-
-                # execute tool in a sandbox
-                # TODO: allow agent_state to specify which sandbox to execute tools in
-                # TODO: This is only temporary, can remove after we publish a pip package with this object
-                agent_state_copy = self.agent_state.__deepcopy__()
-                agent_state_copy.tools = []
-                agent_state_copy.tool_rules = []
-
-                sandbox_run_result = ToolExecutionSandbox(function_name, function_args, self.user, tool_object=target_letta_tool).run(
-                    agent_state=agent_state_copy
-                )
-                function_response, updated_agent_state = sandbox_run_result.func_return, sandbox_run_result.agent_state
-                assert orig_memory_str == self.agent_state.memory.compile(), "Memory should not be modified in a sandbox tool"
-                if updated_agent_state is not None:
-                    self.update_memory_if_changed(updated_agent_state.memory)
-                return function_response, sandbox_run_result
-        except Exception as e:
-            # Need to catch error here, or else trunction wont happen
-            # TODO: modify to function execution error
-            function_response = get_friendly_error_msg(
-                function_name=function_name, exception_name=type(e).__name__, exception_message=str(e)
-            )
-            return function_response, SandboxRunResult(status="error")
-
-        return function_response, None
-
     def _handle_function_error_response(
         self,
         error_msg: str,
@@ -321,13 +220,14 @@ class Agent(BaseAgent):
         messages: List[Message],
         tool_returns: Optional[List[ToolReturn]] = None,
         include_function_failed_message: bool = False,
+        group_id: Optional[str] = None,
     ) -> List[Message]:
         """
         Handle error from function call response
         """
         # Update tool rules
         self.last_function_response = function_response
-        self.tool_rules_solver.update_tool_usage(function_name)
+        self.tool_rules_solver.register_tool_call(function_name)
 
         # Extend conversation with function response
         function_response = package_function_response(False, error_msg)
@@ -341,7 +241,9 @@ class Agent(BaseAgent):
                 "content": function_response,
                 "tool_call_id": tool_call_id,
             },
+            name=self.agent_state.name,
             tool_returns=tool_returns,
+            group_id=group_id,
         )
         messages.append(new_message)
         self.interface.function_message(f"Error: {error_msg}", msg_obj=new_message)
@@ -367,7 +269,10 @@ class Agent(BaseAgent):
     ) -> ChatCompletionResponse:
         """Get response from LLM API with robust retry mechanism."""
         log_telemetry(self.logger, "_get_ai_reply start")
-        allowed_tool_names = self.tool_rules_solver.get_allowed_tool_names(last_function_response=self.last_function_response)
+        available_tools = set([t.name for t in self.agent_state.tools])
+        allowed_tool_names = self.tool_rules_solver.get_allowed_tool_names(
+            available_tools=available_tools, last_function_response=self.last_function_response
+        )
         agent_state_tool_jsons = [t.json_schema for t in self.agent_state.tools]
 
         allowed_functions = (
@@ -377,8 +282,8 @@ class Agent(BaseAgent):
         )
 
         # Don't allow a tool to be called if it failed last time
-        if last_function_failed and self.tool_rules_solver.last_tool_name:
-            allowed_functions = [f for f in allowed_functions if f["name"] != self.tool_rules_solver.last_tool_name]
+        if last_function_failed and self.tool_rules_solver.tool_call_history:
+            allowed_functions = [f for f in allowed_functions if f["name"] != self.tool_rules_solver.tool_call_history[-1]]
             if not allowed_functions:
                 return None
 
@@ -400,10 +305,8 @@ class Agent(BaseAgent):
                 log_telemetry(self.logger, "_get_ai_reply create start")
                 # New LLM client flow
                 llm_client = LLMClient.create(
-                    agent_id=self.agent_state.id,
                     llm_config=self.agent_state.llm_config,
                     put_inner_thoughts_first=put_inner_thoughts_first,
-                    actor_id=self.agent_state.created_by_id,
                 )
 
                 if llm_client and not stream:
@@ -429,6 +332,7 @@ class Agent(BaseAgent):
                         stream=stream,
                         stream_interface=self.interface,
                         put_inner_thoughts_first=put_inner_thoughts_first,
+                        name=self.agent_state.name,
                     )
                 log_telemetry(self.logger, "_get_ai_reply create finish")
 
@@ -472,6 +376,7 @@ class Agent(BaseAgent):
         # and now we want to use it in the creation of the Message object
         # TODO figure out a cleaner way to do this
         response_message_id: Optional[str] = None,
+        group_id: Optional[str] = None,
     ) -> Tuple[List[Message], bool, bool]:
         """Handles parsing and function execution"""
         log_telemetry(self.logger, "_handle_ai_response start")
@@ -517,12 +422,14 @@ class Agent(BaseAgent):
                     user_id=self.agent_state.created_by_id,
                     model=self.model,
                     openai_message_dict=response_message.model_dump(),
+                    name=self.agent_state.name,
+                    group_id=group_id,
                 )
             )  # extend conversation with assistant's reply
-            self.logger.info(f"Function call message: {messages[-1]}")
+            self.logger.debug(f"Function call message: {messages[-1]}")
 
             nonnull_content = False
-            if response_message.content:
+            if response_message.content or response_message.reasoning_content or response_message.redacted_reasoning_content:
                 # The content if then internal monologue, not chat
                 self.interface.internal_monologue(response_message.content, msg_obj=messages[-1])
                 # Flag to avoid printing a duplicate if inner thoughts get popped from the function call
@@ -534,7 +441,7 @@ class Agent(BaseAgent):
                 response_message.function_call if response_message.function_call is not None else response_message.tool_calls[0].function
             )
             function_name = function_call.name
-            self.logger.info(f"Request to call function {function_name} with tool_call_id: {tool_call_id}")
+            self.logger.debug(f"Request to call function {function_name} with tool_call_id: {tool_call_id}")
 
             # Failure case 1: function name is wrong (not in agent_state.tools)
             target_letta_tool = None
@@ -549,7 +456,7 @@ class Agent(BaseAgent):
                 error_msg = f"No function named {function_name}"
                 function_response = "None"  # more like "never ran?"
                 messages = self._handle_function_error_response(
-                    error_msg, tool_call_id, function_name, function_args, function_response, messages
+                    error_msg, tool_call_id, function_name, function_args, function_response, messages, group_id=group_id
                 )
                 return messages, False, True  # force a heartbeat to allow agent to handle error
 
@@ -564,7 +471,7 @@ class Agent(BaseAgent):
                 error_msg = f"Error parsing JSON for function '{function_name}' arguments: {function_call.arguments}"
                 function_response = "None"  # more like "never ran?"
                 messages = self._handle_function_error_response(
-                    error_msg, tool_call_id, function_name, function_args, function_response, messages
+                    error_msg, tool_call_id, function_name, function_args, function_response, messages, group_id=group_id
                 )
                 return messages, False, True  # force a heartbeat to allow agent to handle error
 
@@ -635,6 +542,7 @@ class Agent(BaseAgent):
                         function_response,
                         messages,
                         [tool_return],
+                        group_id=group_id,
                     )
                     return messages, False, True  # force a heartbeat to allow agent to handle error
 
@@ -671,6 +579,7 @@ class Agent(BaseAgent):
                     messages,
                     [ToolReturn(status="error", stderr=[error_msg_user])],
                     include_function_failed_message=True,
+                    group_id=group_id,
                 )
                 return messages, False, True  # force a heartbeat to allow agent to handle error
 
@@ -695,6 +604,7 @@ class Agent(BaseAgent):
                     messages,
                     [tool_return],
                     include_function_failed_message=True,
+                    group_id=group_id,
                 )
                 return messages, False, True  # force a heartbeat to allow agent to handle error
 
@@ -720,7 +630,9 @@ class Agent(BaseAgent):
                         "content": function_response,
                         "tool_call_id": tool_call_id,
                     },
+                    name=self.agent_state.name,
                     tool_returns=[tool_return] if sandbox_run_result else None,
+                    group_id=group_id,
                 )
             )  # extend conversation with function response
             self.interface.function_message(f"Ran {function_name}({function_args})", msg_obj=messages[-1])
@@ -736,6 +648,8 @@ class Agent(BaseAgent):
                     user_id=self.agent_state.created_by_id,
                     model=self.model,
                     openai_message_dict=response_message.model_dump(),
+                    name=self.agent_state.name,
+                    group_id=group_id,
                 )
             )  # extend conversation with assistant's reply
             self.interface.internal_monologue(response_message.content, msg_obj=messages[-1])
@@ -747,7 +661,7 @@ class Agent(BaseAgent):
         self.agent_state = self.agent_manager.rebuild_system_prompt(agent_id=self.agent_state.id, actor=self.user)
 
         # Update ToolRulesSolver state with last called function
-        self.tool_rules_solver.update_tool_usage(function_name)
+        self.tool_rules_solver.register_tool_call(function_name)
         # Update heartbeat request according to provided tool rules
         if self.tool_rules_solver.has_children_tools(function_name):
             heartbeat_request = True
@@ -773,11 +687,17 @@ class Agent(BaseAgent):
         **kwargs,
     ) -> LettaUsageStatistics:
         """Run Agent.step in a loop, handling chaining via heartbeat requests and function failures"""
+        # Defensively clear the tool rules solver history
+        # Usually this would be extraneous as Agent loop is re-loaded on every message send
+        # But just to be safe
+        self.tool_rules_solver.clear_tool_history()
+
         next_input_message = messages if isinstance(messages, list) else [messages]
         counter = 0
         total_usage = UsageStatistics()
         step_count = 0
         function_failed = False
+        steps_messages = []
         while True:
             kwargs["first_message"] = False
             kwargs["step_count"] = step_count
@@ -792,6 +712,7 @@ class Agent(BaseAgent):
             function_failed = step_response.function_failed
             token_warning = step_response.in_context_memory_warning
             usage = step_response.usage
+            steps_messages.append(step_response.messages)
 
             step_count += 1
             total_usage += usage
@@ -851,9 +772,10 @@ class Agent(BaseAgent):
                 break
 
         if self.agent_state.message_buffer_autoclear:
-            self.agent_manager.trim_all_in_context_messages_except_system(self.agent_state.id, actor=self.user)
+            self.logger.info("Autoclearing message buffer")
+            self.agent_state = self.agent_manager.trim_all_in_context_messages_except_system(self.agent_state.id, actor=self.user)
 
-        return LettaUsageStatistics(**total_usage.model_dump(), step_count=step_count)
+        return LettaUsageStatistics(**total_usage.model_dump(), step_count=step_count, steps_messages=steps_messages)
 
     def inner_step(
         self,
@@ -891,7 +813,11 @@ class Agent(BaseAgent):
             in_context_messages = self.agent_manager.get_in_context_messages(agent_id=self.agent_state.id, actor=self.user)
             input_message_sequence = in_context_messages + messages
 
-            if len(input_message_sequence) > 1 and input_message_sequence[-1].role != "user":
+            if (
+                len(input_message_sequence) > 1
+                and input_message_sequence[-1].role != "user"
+                and input_message_sequence[-1].group_id is None
+            ):
                 self.logger.warning(f"{CLI_WARNING_PREFIX}Attempting to run ChatCompletion without user as the last message in the queue")
 
             # Step 2: send the conversation and available functions to the LLM
@@ -924,6 +850,7 @@ class Agent(BaseAgent):
                 # TODO this is kind of hacky, find a better way to handle this
                 # the only time we set up message creation ahead of time is when streaming is on
                 response_message_id=response.id if stream else None,
+                group_id=input_message_sequence[-1].group_id,
             )
 
             # Step 6: extend the message history
@@ -1024,8 +951,6 @@ class Agent(BaseAgent):
                         f"step() failed with an exception that looks like a context window overflow, but message buffer is set to autoclear, so skipping: '{str(e)}'"
                     )
                     raise e
-
-                summarize_attempt_count += 1
 
                 if summarize_attempt_count <= summarizer_settings.max_summarizer_retries:
                     logger.warning(
@@ -1294,6 +1219,107 @@ class Agent(BaseAgent):
         """Count the tokens in the current context window"""
         context_window_breakdown = self.get_context_window()
         return context_window_breakdown.context_window_size_current
+
+    # TODO: Refactor into separate class v.s. large if/elses here
+    def execute_tool_and_persist_state(
+        self, function_name: str, function_args: dict, target_letta_tool: Tool
+    ) -> tuple[Any, Optional[SandboxRunResult]]:
+        """
+        Execute tool modifications and persist the state of the agent.
+        Note: only some agent state modifications will be persisted, such as data in the AgentState ORM and block data
+        """
+        # TODO: add agent manager here
+        orig_memory_str = self.agent_state.memory.compile()
+
+        # TODO: need to have an AgentState object that actually has full access to the block data
+        # this is because the sandbox tools need to be able to access block.value to edit this data
+        try:
+            if target_letta_tool.tool_type == ToolType.LETTA_CORE:
+                # base tools are allowed to access the `Agent` object and run on the database
+                callable_func = get_function_from_module(LETTA_CORE_TOOL_MODULE_NAME, function_name)
+                function_args["self"] = self  # need to attach self to arg since it's dynamically linked
+                function_response = callable_func(**function_args)
+            elif target_letta_tool.tool_type == ToolType.LETTA_MULTI_AGENT_CORE:
+                callable_func = get_function_from_module(LETTA_MULTI_AGENT_TOOL_MODULE_NAME, function_name)
+                function_args["self"] = self  # need to attach self to arg since it's dynamically linked
+                function_response = callable_func(**function_args)
+            elif target_letta_tool.tool_type == ToolType.LETTA_MEMORY_CORE:
+                callable_func = get_function_from_module(LETTA_CORE_TOOL_MODULE_NAME, function_name)
+                agent_state_copy = self.agent_state.__deepcopy__()
+                function_args["agent_state"] = agent_state_copy  # need to attach self to arg since it's dynamically linked
+                function_response = callable_func(**function_args)
+                self.update_memory_if_changed(agent_state_copy.memory)
+            elif target_letta_tool.tool_type == ToolType.EXTERNAL_COMPOSIO:
+                action_name = generate_composio_action_from_func_name(target_letta_tool.name)
+                # Get entity ID from the agent_state
+                entity_id = None
+                for env_var in self.agent_state.tool_exec_environment_variables:
+                    if env_var.key == COMPOSIO_ENTITY_ENV_VAR_KEY:
+                        entity_id = env_var.value
+                # Get composio_api_key
+                composio_api_key = get_composio_api_key(actor=self.user, logger=self.logger)
+                function_response = execute_composio_action(
+                    action_name=action_name, args=function_args, api_key=composio_api_key, entity_id=entity_id
+                )
+            elif target_letta_tool.tool_type == ToolType.EXTERNAL_MCP:
+                # Get the server name from the tool tag
+                # TODO make a property instead?
+                server_name = target_letta_tool.tags[0].split(":")[1]
+
+                # Get the MCPClient from the server's handle
+                # TODO these don't get raised properly
+                if not self.mcp_clients:
+                    raise ValueError(f"No MCP client available to use")
+                if server_name not in self.mcp_clients:
+                    raise ValueError(f"Unknown MCP server name: {server_name}")
+                mcp_client = self.mcp_clients[server_name]
+                if not isinstance(mcp_client, BaseMCPClient):
+                    raise RuntimeError(f"Expected an MCPClient, but got: {type(mcp_client)}")
+
+                # Check that tool exists
+                available_tools = mcp_client.list_tools()
+                available_tool_names = [t.name for t in available_tools]
+                if function_name not in available_tool_names:
+                    raise ValueError(
+                        f"{function_name} is not available in MCP server {server_name}. Please check your `~/.letta/mcp_config.json` file."
+                    )
+
+                function_response, is_error = mcp_client.execute_tool(tool_name=function_name, tool_args=function_args)
+                sandbox_run_result = SandboxRunResult(status="error" if is_error else "success")
+                return function_response, sandbox_run_result
+            else:
+                try:
+                    # Parse the source code to extract function annotations
+                    annotations = get_function_annotations_from_source(target_letta_tool.source_code, function_name)
+                    # Coerce the function arguments to the correct types based on the annotations
+                    function_args = coerce_dict_args_by_annotations(function_args, annotations)
+                except ValueError as e:
+                    self.logger.debug(f"Error coercing function arguments: {e}")
+
+                # execute tool in a sandbox
+                # TODO: allow agent_state to specify which sandbox to execute tools in
+                # TODO: This is only temporary, can remove after we publish a pip package with this object
+                agent_state_copy = self.agent_state.__deepcopy__()
+                agent_state_copy.tools = []
+                agent_state_copy.tool_rules = []
+
+                sandbox_run_result = ToolExecutionSandbox(function_name, function_args, self.user, tool_object=target_letta_tool).run(
+                    agent_state=agent_state_copy
+                )
+                function_response, updated_agent_state = sandbox_run_result.func_return, sandbox_run_result.agent_state
+                assert orig_memory_str == self.agent_state.memory.compile(), "Memory should not be modified in a sandbox tool"
+                if updated_agent_state is not None:
+                    self.update_memory_if_changed(updated_agent_state.memory)
+                return function_response, sandbox_run_result
+        except Exception as e:
+            # Need to catch error here, or else trunction wont happen
+            # TODO: modify to function execution error
+            function_response = get_friendly_error_msg(
+                function_name=function_name, exception_name=type(e).__name__, exception_message=str(e)
+            )
+            return function_response, SandboxRunResult(status="error")
+
+        return function_response, None
 
 
 def save_agent(agent: Agent):

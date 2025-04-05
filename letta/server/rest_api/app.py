@@ -1,3 +1,5 @@
+import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -43,16 +45,6 @@ interface: StreamingServerInterface = StreamingServerInterface
 server = SyncServer(default_interface_factory=lambda: interface())
 logger = get_logger(__name__)
 
-# TODO: remove
-password = None
-## TODO(ethan): eventuall remove
-# if password := settings.server_pass:
-#    # if the pass was specified in the environment, use it
-#    print(f"Using existing admin server password from environment.")
-# else:
-#    # Autogenerate a password for this session and dump it to stdout
-#    password = secrets.token_urlsafe(16)
-#    #typer.secho(f"Generated admin server password for this session: {password}", fg=typer.colors.GREEN)
 
 import logging
 import platform
@@ -144,6 +136,13 @@ def create_application() -> "FastAPI":
         version="1.0.0",  # TODO wire this up to the version in the package
         debug=debug_mode,  # if True, the stack trace will be printed in the response
     )
+
+    @app.on_event("startup")
+    async def configure_executor():
+        print(f"Configured event loop executor with {settings.event_loop_threadpool_max_workers} workers.")
+        loop = asyncio.get_running_loop()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=settings.event_loop_threadpool_max_workers)
+        loop.set_default_executor(executor)
 
     @app.on_event("shutdown")
     def shutdown_mcp_clients():
@@ -256,15 +255,15 @@ def create_application() -> "FastAPI":
     )
 
     # Set up OpenTelemetry tracing
-    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-    if endpoint:
-        print(f"▶ Using OTLP tracing with endpoint: {endpoint}")
+    otlp_endpoint = settings.otel_exporter_otlp_endpoint
+    if otlp_endpoint and not settings.disable_tracing:
+        print(f"▶ Using OTLP tracing with endpoint: {otlp_endpoint}")
         env_name_suffix = os.getenv("ENV_NAME")
         service_name = f"letta-server-{env_name_suffix.lower()}" if env_name_suffix else "letta-server"
         from letta.tracing import setup_tracing
 
         setup_tracing(
-            endpoint=endpoint,
+            endpoint=otlp_endpoint,
             app=app,
             service_name=service_name,
         )
@@ -287,7 +286,7 @@ def create_application() -> "FastAPI":
     app.include_router(openai_chat_completions_router, prefix=OPENAI_API_PREFIX)
 
     # /api/auth endpoints
-    app.include_router(setup_auth_router(server, interface, password), prefix=API_PREFIX)
+    app.include_router(setup_auth_router(server, interface, random_password), prefix=API_PREFIX)
 
     # / static files
     mount_static_files(app)
@@ -326,7 +325,7 @@ def start_server(
         print(f"▶ Server running at: https://{host or 'localhost'}:{port or REST_DEFAULT_PORT}")
         print(f"▶ View using ADE at: https://app.letta.com/development-servers/local/dashboard\n")
         uvicorn.run(
-            app,
+            "letta.server.rest_api.app:app",
             host=host or "localhost",
             port=port or REST_DEFAULT_PORT,
             workers=settings.uvicorn_workers,
@@ -345,7 +344,7 @@ def start_server(
             print(f"▶ View using ADE at: https://app.letta.com/development-servers/local/dashboard\n")
 
         uvicorn.run(
-            app,
+            "letta.server.rest_api.app:app",
             host=host or "localhost",
             port=port or REST_DEFAULT_PORT,
             workers=settings.uvicorn_workers,

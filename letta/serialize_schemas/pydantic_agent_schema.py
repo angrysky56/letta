@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -10,12 +10,10 @@ from letta.schemas.llm_config import LLMConfig
 class CoreMemoryBlockSchema(BaseModel):
     created_at: str
     description: Optional[str]
-    identities: List[Any]
-    is_deleted: bool
     is_template: bool
     label: str
     limit: int
-    metadata_: Dict[str, Any] = Field(default_factory=dict)
+    metadata_: Optional[Dict] = None
     template_name: Optional[str]
     updated_at: str
     value: str
@@ -24,7 +22,6 @@ class CoreMemoryBlockSchema(BaseModel):
 class MessageSchema(BaseModel):
     created_at: str
     group_id: Optional[str]
-    in_context: bool
     model: Optional[str]
     name: Optional[str]
     role: str
@@ -42,15 +39,34 @@ class TagSchema(BaseModel):
 class ToolEnvVarSchema(BaseModel):
     created_at: str
     description: Optional[str]
-    is_deleted: bool
     key: str
     updated_at: str
     value: str
 
 
-class ToolRuleSchema(BaseModel):
+# Tool rules
+
+
+class BaseToolRuleSchema(BaseModel):
     tool_name: str
     type: str
+
+
+class ChildToolRuleSchema(BaseToolRuleSchema):
+    children: List[str]
+
+
+class MaxCountPerStepToolRuleSchema(BaseToolRuleSchema):
+    max_count_limit: int
+
+
+class ConditionalToolRuleSchema(BaseToolRuleSchema):
+    default_child: Optional[str]
+    child_output_mapping: Dict[Any, str]
+    require_output_mapping: bool
+
+
+ToolRuleSchema = Union[BaseToolRuleSchema, ChildToolRuleSchema, MaxCountPerStepToolRuleSchema, ConditionalToolRuleSchema]
 
 
 class ParameterProperties(BaseModel):
@@ -76,7 +92,6 @@ class ToolSchema(BaseModel):
     args_json_schema: Optional[Any]
     created_at: str
     description: str
-    is_deleted: bool
     json_schema: ToolJSONSchema
     name: str
     return_char_limit: int
@@ -85,21 +100,20 @@ class ToolSchema(BaseModel):
     tags: List[str]
     tool_type: str
     updated_at: str
+    metadata_: Optional[Dict] = None
 
 
 class AgentSchema(BaseModel):
     agent_type: str
     core_memory: List[CoreMemoryBlockSchema]
     created_at: str
-    description: str
+    description: Optional[str]
     embedding_config: EmbeddingConfig
-    groups: List[Any]
-    identities: List[Any]
-    is_deleted: bool
     llm_config: LLMConfig
     message_buffer_autoclear: bool
+    in_context_message_indices: List[int]
     messages: List[MessageSchema]
-    metadata_: Dict
+    metadata_: Optional[Dict] = None
     multi_agent_group: Optional[Any]
     name: str
     system: str

@@ -80,7 +80,7 @@ async def sse_async_generator(
                     err_msg = f"Expected LettaUsageStatistics, got {type(usage)}"
                     logger.error(err_msg)
                     raise ValueError(err_msg)
-                yield sse_formatter(usage.model_dump())
+                yield sse_formatter(usage.model_dump(exclude={"steps_messages"}))
 
             except ContextWindowExceededError as e:
                 log_error_to_sentry(e)
@@ -211,7 +211,6 @@ def create_tool_call_messages_from_openai_response(
         tool_calls=[],
         tool_call_id=tool_call_id,
         created_at=get_utc_time(),
-        name=function_name,
     )
     messages.append(tool_message)
 

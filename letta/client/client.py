@@ -546,6 +546,7 @@ class RESTClient(AbstractClient):
         tool_ids: Optional[List[str]] = None,
         tool_rules: Optional[List[BaseToolRule]] = None,
         include_base_tools: Optional[bool] = True,
+        include_multi_agent_tools: Optional[bool] = False,
         # metadata
         metadata: Optional[Dict] = {"human:": DEFAULT_HUMAN, "persona": DEFAULT_PERSONA},
         description: Optional[str] = None,
@@ -613,6 +614,7 @@ class RESTClient(AbstractClient):
             "tags": tags,
             "include_base_tools": include_base_tools,
             "message_buffer_autoclear": message_buffer_autoclear,
+            "include_multi_agent_tools": include_multi_agent_tools,
         }
 
         # Only add name if it's not None
@@ -2937,7 +2939,6 @@ class LocalClient(AbstractClient):
 
         Args:
             func (callable): The function to create a tool for.
-            name: (str): Name of the tool (must be unique per-user.)
             tags (Optional[List[str]], optional): Tags for the tool. Defaults to None.
             description (str, optional): The description.
             return_char_limit (int): The character limit for the tool's return value. Defaults to FUNCTION_RETURN_CHAR_LIMIT.
@@ -2950,6 +2951,7 @@ class LocalClient(AbstractClient):
         # parse source code/schema
         source_code = parse_source_code(func)
         source_type = "python"
+        name = func.__name__  # Initialize name using function's __name__
         if not tags:
             tags = []
 

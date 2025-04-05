@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SystemMessage(BaseModel):
@@ -74,7 +74,25 @@ class ToolFunctionChoice(BaseModel):
     function: FunctionCall
 
 
-ToolChoice = Union[Literal["none", "auto", "required"], ToolFunctionChoice]
+class AnthropicToolChoiceTool(BaseModel):
+    type: str = "tool"
+    name: str
+    disable_parallel_tool_use: Optional[bool] = False
+
+
+class AnthropicToolChoiceAny(BaseModel):
+    type: str = "any"
+    disable_parallel_tool_use: Optional[bool] = False
+
+
+class AnthropicToolChoiceAuto(BaseModel):
+    type: str = "auto"
+    disable_parallel_tool_use: Optional[bool] = False
+
+
+ToolChoice = Union[
+    Literal["none", "auto", "required", "any"], ToolFunctionChoice, AnthropicToolChoiceTool, AnthropicToolChoiceAny, AnthropicToolChoiceAuto
+]
 
 
 ## tools ##
@@ -82,6 +100,7 @@ class FunctionSchema(BaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None  # JSON Schema for the parameters
+    strict: bool = False
 
 
 class Tool(BaseModel):
@@ -121,3 +140,8 @@ class ChatCompletionRequest(BaseModel):
     # deprecated scheme
     functions: Optional[List[FunctionSchema]] = None
     function_call: Optional[FunctionCallChoice] = None
+
+    @field_validator("messages", mode="before")
+    @classmethod
+    def cast_all_messages(cls, v):
+        return [cast_message_to_subtype(m) if isinstance(m, dict) else m for m in v]

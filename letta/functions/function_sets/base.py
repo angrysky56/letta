@@ -14,7 +14,8 @@ def send_message(self: "Agent", message: str) -> Optional[str]:
         Optional[str]: None is always returned as this function does not produce a response.
     """
     # FIXME passing of msg_obj here is a hack, unclear if guaranteed to be the correct reference
-    self.interface.assistant_message(message)  # , msg_obj=self._messages[-1])
+    if self.interface:
+        self.interface.assistant_message(message)  # , msg_obj=self._messages[-1])
     return None
 
 
@@ -44,7 +45,7 @@ def conversation_search(self: "Agent", query: str, page: Optional[int] = 0) -> O
     count = RETRIEVAL_QUERY_DEFAULT_PAGE_SIZE
     # TODO: add paging by page number. currently cursor only works with strings.
     # original: start=page * count
-    messages = self.message_manager.list_user_messages_for_agent(
+    messages = self.message_manager.list_messages_for_agent(
         agent_id=self.agent_state.id,
         actor=self.user,
         query_text=query,

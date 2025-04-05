@@ -26,6 +26,7 @@ from letta.functions.mcp_client.stdio_client import StdioMCPClient
 from letta.functions.mcp_client.types import MCPServerType, MCPTool, SSEServerConfig, StdioServerConfig
 from letta.helpers.datetime_helpers import get_utc_time
 from letta.helpers.json_helpers import json_dumps, json_loads
+from letta.helpers.message_helper import prepare_input_message_create
 
 # TODO use custom interface
 from letta.interface import AgentInterface  # abstract
@@ -34,7 +35,7 @@ from letta.log import get_logger
 from letta.offline_memory_agent import OfflineMemoryAgent
 from letta.orm.errors import NoResultFound
 from letta.round_robin_multi_agent import RoundRobinMultiAgent
-from letta.schemas.agent import AgentState, AgentType, CreateAgent
+from letta.schemas.agent import AgentState, AgentType, CreateAgent, UpdateAgent
 from letta.schemas.block import BlockUpdate
 from letta.schemas.embedding_config import EmbeddingConfig
 
@@ -48,7 +49,7 @@ from letta.schemas.letta_message_content import TextContent
 from letta.schemas.letta_response import LettaResponse
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import ArchivalMemorySummary, ContextWindowOverview, Memory, RecallMemorySummary
-from letta.schemas.message import Message, MessageCreate, MessageRole, MessageUpdate
+from letta.schemas.message import Message, MessageCreate, MessageUpdate
 from letta.schemas.organization import Organization
 from letta.schemas.passage import Passage, PassageUpdate
 from letta.schemas.providers import (
@@ -85,12 +86,11 @@ from letta.services.job_manager import JobManager
 from letta.services.message_manager import MessageManager
 from letta.services.organization_manager import OrganizationManager
 from letta.services.passage_manager import PassageManager
-from letta.services.per_agent_lock_manager import PerAgentLockManager
 from letta.services.provider_manager import ProviderManager
 from letta.services.sandbox_config_manager import SandboxConfigManager
 from letta.services.source_manager import SourceManager
 from letta.services.step_manager import StepManager
-from letta.services.tool_execution_sandbox import ToolExecutionSandbox
+from letta.services.tool_executor.tool_execution_sandbox import ToolExecutionSandbox
 from letta.services.tool_manager import ToolManager
 from letta.services.user_manager import UserManager
 from letta.settings import model_settings, settings, tool_settings
@@ -166,7 +166,7 @@ class SyncServer(Server):
     def __init__(
         self,
         chaining: bool = True,
-        max_chaining_steps: Optional[bool] = None,
+        max_chaining_steps: Optional[int] = 100,
         default_interface_factory: Callable[[], AgentInterface] = lambda: CLIInterface(),
         init_with_default_org_and_user: bool = True,
         # default_interface: AgentInterface = CLIInterface(),
@@ -209,9 +209,6 @@ class SyncServer(Server):
         self.step_manager = StepManager()
         self.identity_manager = IdentityManager()
         self.group_manager = GroupManager()
-
-        # Managers that interface with parallelism
-        self.per_agent_lock_manager = PerAgentLockManager()
 
         # Make default user and org
         if init_with_default_org_and_user:
@@ -332,14 +329,14 @@ class SyncServer(Server):
 
         for server_name, server_config in mcp_server_configs.items():
             if server_config.type == MCPServerType.SSE:
-                self.mcp_clients[server_name] = SSEMCPClient()
+                self.mcp_clients[server_name] = SSEMCPClient(server_config)
             elif server_config.type == MCPServerType.STDIO:
-                self.mcp_clients[server_name] = StdioMCPClient()
+                self.mcp_clients[server_name] = StdioMCPClient(server_config)
             else:
                 raise ValueError(f"Invalid MCP server config: {server_config}")
 
             try:
-                self.mcp_clients[server_name].connect_to_server(server_config)
+                self.mcp_clients[server_name].connect_to_server()
             except Exception as e:
                 logger.error(e)
                 self.mcp_clients.pop(server_name)
@@ -353,25 +350,26 @@ class SyncServer(Server):
 
     def load_agent(self, agent_id: str, actor: User, interface: Union[AgentInterface, None] = None) -> Agent:
         """Updated method to load agents from persisted storage"""
-        agent_lock = self.per_agent_lock_manager.get_lock(agent_id)
-        with agent_lock:
-            agent_state = self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
-            if agent_state.multi_agent_group:
-                return self.load_multi_agent(agent_state.multi_agent_group, actor, interface, agent_state)
+        agent_state = self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
+        if agent_state.multi_agent_group:
+            return self.load_multi_agent(agent_state.multi_agent_group, actor, interface, agent_state)
 
-            interface = interface or self.default_interface_factory()
-            if agent_state.agent_type == AgentType.memgpt_agent:
-                agent = Agent(agent_state=agent_state, interface=interface, user=actor, mcp_clients=self.mcp_clients)
-            elif agent_state.agent_type == AgentType.offline_memory_agent:
-                agent = OfflineMemoryAgent(agent_state=agent_state, interface=interface, user=actor)
-            else:
-                raise ValueError(f"Invalid agent type {agent_state.agent_type}")
+        interface = interface or self.default_interface_factory()
+        if agent_state.agent_type == AgentType.memgpt_agent:
+            agent = Agent(agent_state=agent_state, interface=interface, user=actor, mcp_clients=self.mcp_clients)
+        elif agent_state.agent_type == AgentType.offline_memory_agent:
+            agent = OfflineMemoryAgent(agent_state=agent_state, interface=interface, user=actor)
+        else:
+            raise ValueError(f"Invalid agent type {agent_state.agent_type}")
 
-            return agent
+        return agent
 
     def load_multi_agent(
         self, group: Group, actor: User, interface: Union[AgentInterface, None] = None, agent_state: Optional[AgentState] = None
     ) -> Agent:
+        if len(group.agent_ids) == 0:
+            raise ValueError("Empty group: group must have at least one agent")
+
         match group.manager_type:
             case ManagerType.round_robin:
                 agent_state = agent_state or self.agent_manager.get_agent_by_id(agent_id=group.agent_ids[0], actor=actor)
@@ -702,56 +700,22 @@ class SyncServer(Server):
         actor: User,
         agent_id: str,
         messages: Union[List[MessageCreate], List[Message]],
-        # whether or not to wrap user and system message as MemGPT-style stringified JSON
         wrap_user_message: bool = True,
         wrap_system_message: bool = True,
-        interface: Union[AgentInterface, ChatCompletionsStreamingInterface, None] = None,  # needed to getting responses
+        interface: Union[AgentInterface, ChatCompletionsStreamingInterface, None] = None,  # needed for responses
         metadata: Optional[dict] = None,  # Pass through metadata to interface
         put_inner_thoughts_first: bool = True,
     ) -> LettaUsageStatistics:
-        """Send a list of messages to the agent
+        """Send a list of messages to the agent.
 
-        If the messages are of type MessageCreate, we need to turn them into
-        Message objects first before sending them through step.
-
-        Otherwise, we can pass them in directly.
+        If messages are of type MessageCreate, convert them to Message objects before sending.
         """
-        message_objects: List[Message] = []
-
         if all(isinstance(m, MessageCreate) for m in messages):
-            for message in messages:
-                assert isinstance(message, MessageCreate)
-
-                # If wrapping is enabled, wrap with metadata before placing content inside the Message object
-                if message.role == MessageRole.user and wrap_user_message:
-                    message.content = system.package_user_message(user_message=message.content)
-                elif message.role == MessageRole.system and wrap_system_message:
-                    message.content = system.package_system_message(system_message=message.content)
-                else:
-                    raise ValueError(f"Invalid message role: {message.role}")
-
-                # Create the Message object
-                message_objects.append(
-                    Message(
-                        agent_id=agent_id,
-                        role=message.role,
-                        content=[TextContent(text=message.content)] if message.content else [],
-                        name=message.name,
-                        # assigned later?
-                        model=None,
-                        # irrelevant
-                        tool_calls=None,
-                        tool_call_id=None,
-                    )
-                )
-
+            message_objects = [prepare_input_message_create(m, agent_id, wrap_user_message, wrap_system_message) for m in messages]
         elif all(isinstance(m, Message) for m in messages):
-            for message in messages:
-                assert isinstance(message, Message)
-                message_objects.append(message)
-
+            message_objects = messages
         else:
-            raise ValueError(f"All messages must be of type Message or MessageCreate, got {[type(message) for message in messages]}")
+            raise ValueError(f"All messages must be of type Message or MessageCreate, got {[type(m) for m in messages]}")
 
         # Store metadata in interface if provided
         if metadata and hasattr(interface, "metadata"):
@@ -785,7 +749,13 @@ class SyncServer(Server):
         if request.llm_config is None:
             if request.model is None:
                 raise ValueError("Must specify either model or llm_config in request")
-            request.llm_config = self.get_llm_config_from_handle(handle=request.model, context_window_limit=request.context_window_limit)
+            request.llm_config = self.get_llm_config_from_handle(
+                handle=request.model,
+                context_window_limit=request.context_window_limit,
+                max_tokens=request.max_tokens,
+                max_reasoning_tokens=request.max_reasoning_tokens,
+                enable_reasoner=request.enable_reasoner,
+            )
 
         if request.embedding_config is None:
             if request.embedding is None:
@@ -798,6 +768,25 @@ class SyncServer(Server):
         # Invoke manager
         return self.agent_manager.create_agent(
             agent_create=request,
+            actor=actor,
+        )
+
+    def update_agent(
+        self,
+        agent_id: str,
+        request: UpdateAgent,
+        actor: User,
+    ) -> AgentState:
+        if request.model is not None:
+            request.llm_config = self.get_llm_config_from_handle(handle=request.model)
+
+        if request.embedding is not None:
+            request.embedding_config = self.get_embedding_config_from_handle(handle=request.embedding)
+
+        # Invoke manager
+        return self.agent_manager.update_agent(
+            agent_id=agent_id,
+            agent_update=request,
             actor=actor,
         )
 
@@ -823,6 +812,8 @@ class SyncServer(Server):
         limit: Optional[int] = 100,
         order_by: Optional[str] = "created_at",
         reverse: Optional[bool] = False,
+        query_text: Optional[str] = None,
+        ascending: Optional[bool] = True,
     ) -> List[Passage]:
         # TODO: Thread actor directly through this function, since the top level caller most likely already retrieved the user
         actor = self.user_manager.get_user_or_default(user_id=user_id)
@@ -832,9 +823,10 @@ class SyncServer(Server):
             actor=actor,
             agent_id=agent_id,
             after=after,
+            query_text=query_text,
             before=before,
+            ascending=ascending,
             limit=limit,
-            ascending=not reverse,
         )
         return records
 
@@ -873,6 +865,7 @@ class SyncServer(Server):
         after: Optional[str] = None,
         before: Optional[str] = None,
         limit: Optional[int] = 100,
+        group_id: Optional[str] = None,
         reverse: Optional[bool] = False,
         return_message_object: bool = True,
         use_assistant_message: bool = True,
@@ -890,6 +883,7 @@ class SyncServer(Server):
             before=before,
             limit=limit,
             ascending=not reverse,
+            group_id=group_id,
         )
 
         if not return_message_object:
@@ -1071,9 +1065,6 @@ class SyncServer(Server):
 
         llm_models.extend(self.get_local_llm_configs())
 
-        # respect global maximum
-        for llm_config in llm_models:
-            llm_config.context_window = min(llm_config.context_window, model_settings.global_max_context_window_limit)
         return llm_models
 
     def list_embedding_models(self) -> List[EmbeddingConfig]:
@@ -1092,7 +1083,14 @@ class SyncServer(Server):
         # Merge the two dictionaries, keeping the values from providers_from_db where conflicts occur
         return {**providers_from_env, **providers_from_db}.values()
 
-    def get_llm_config_from_handle(self, handle: str, context_window_limit: Optional[int] = None) -> LLMConfig:
+    def get_llm_config_from_handle(
+        self,
+        handle: str,
+        context_window_limit: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        max_reasoning_tokens: Optional[int] = None,
+        enable_reasoner: Optional[bool] = None,
+    ) -> LLMConfig:
         try:
             provider_name, model_name = handle.split("/", 1)
             provider = self.get_provider_from_name(provider_name)
@@ -1114,12 +1112,21 @@ class SyncServer(Server):
         else:
             llm_config = llm_configs[0]
 
-        if context_window_limit:
+        if context_window_limit is not None:
             if context_window_limit > llm_config.context_window:
                 raise ValueError(f"Context window limit ({context_window_limit}) is greater than maximum of ({llm_config.context_window})")
             llm_config.context_window = context_window_limit
         else:
             llm_config.context_window = min(llm_config.context_window, model_settings.global_max_context_window_limit)
+
+        if max_tokens is not None:
+            llm_config.max_tokens = max_tokens
+        if max_reasoning_tokens is not None:
+            if not max_tokens or max_reasoning_tokens > max_tokens:
+                raise ValueError(f"Max reasoning tokens ({max_reasoning_tokens}) must be less than max tokens ({max_tokens})")
+            llm_config.max_reasoning_tokens = max_reasoning_tokens
+        if enable_reasoner is not None:
+            llm_config.enable_reasoner = enable_reasoner
 
         return llm_config
 
@@ -1195,6 +1202,7 @@ class SyncServer(Server):
         tool_source_type: Optional[str] = None,
         tool_name: Optional[str] = None,
         tool_args_json_schema: Optional[Dict[str, Any]] = None,
+        tool_json_schema: Optional[Dict[str, Any]] = None,
     ) -> ToolReturnMessage:
         """Run a tool from source code"""
         if tool_source_type is not None and tool_source_type != "python":
@@ -1206,6 +1214,11 @@ class SyncServer(Server):
             source_code=tool_source,
             args_json_schema=tool_args_json_schema,
         )
+
+        # If tools_json_schema is explicitly passed in, override it on the created Tool object
+        if tool_json_schema:
+            tool.json_schema = tool_json_schema
+
         assert tool.name is not None, "Failed to create tool object"
 
         # TODO eventually allow using agent state in tools
@@ -1266,6 +1279,11 @@ class SyncServer(Server):
     # TODO support both command + SSE servers (via config)
     def get_mcp_servers(self) -> dict[str, Union[SSEServerConfig, StdioServerConfig]]:
         """List the MCP servers in the config (doesn't test that they are actually working)"""
+
+        # TODO implement non-flatfile mechanism
+        if not tool_settings.mcp_read_from_config:
+            raise RuntimeError("MCP config file disabled. Enable it in settings.")
+
         mcp_server_list = {}
 
         # Attempt to read from ~/.letta/mcp_config.json
@@ -1326,13 +1344,18 @@ class SyncServer(Server):
 
     def add_mcp_server_to_config(
         self, server_config: Union[SSEServerConfig, StdioServerConfig], allow_upsert: bool = True
-    ) -> dict[str, Union[SSEServerConfig, StdioServerConfig]]:
+    ) -> List[Union[SSEServerConfig, StdioServerConfig]]:
         """Add a new server config to the MCP config file"""
+
+        # TODO implement non-flatfile mechanism
+        if not tool_settings.mcp_read_from_config:
+            raise RuntimeError("MCP config file disabled. Enable it in settings.")
 
         # If the config file doesn't exist, throw an error.
         mcp_config_path = os.path.join(constants.LETTA_DIR, constants.MCP_CONFIG_NAME)
         if not os.path.exists(mcp_config_path):
-            raise FileNotFoundError(f"MCP config file not found: {mcp_config_path}")
+            # Create the file if it doesn't exist
+            logger.debug(f"MCP config file not found, creating new file at: {mcp_config_path}")
 
         # If the file does exist, attempt to parse it get calling get_mcp_servers
         try:
@@ -1348,13 +1371,13 @@ class SyncServer(Server):
 
         # Attempt to initialize the connection to the server
         if server_config.type == MCPServerType.SSE:
-            new_mcp_client = SSEMCPClient()
+            new_mcp_client = SSEMCPClient(server_config)
         elif server_config.type == MCPServerType.STDIO:
-            new_mcp_client = StdioMCPClient()
+            new_mcp_client = StdioMCPClient(server_config)
         else:
             raise ValueError(f"Invalid MCP server config: {server_config}")
         try:
-            new_mcp_client.connect_to_server(server_config)
+            new_mcp_client.connect_to_server()
         except:
             logger.exception(f"Failed to connect to MCP server: {server_config.server_name}")
             raise RuntimeError(f"Failed to connect to MCP server: {server_config.server_name}")
@@ -1384,9 +1407,14 @@ class SyncServer(Server):
     def delete_mcp_server_from_config(self, server_name: str) -> dict[str, Union[SSEServerConfig, StdioServerConfig]]:
         """Delete a server config from the MCP config file"""
 
+        # TODO implement non-flatfile mechanism
+        if not tool_settings.mcp_read_from_config:
+            raise RuntimeError("MCP config file disabled. Enable it in settings.")
+
         # If the config file doesn't exist, throw an error.
         mcp_config_path = os.path.join(constants.LETTA_DIR, constants.MCP_CONFIG_NAME)
         if not os.path.exists(mcp_config_path):
+            # If the file doesn't exist, raise an error
             raise FileNotFoundError(f"MCP config file not found: {mcp_config_path}")
 
         # If the file does exist, attempt to parse it get calling get_mcp_servers
@@ -1568,88 +1596,76 @@ class SyncServer(Server):
     ) -> Union[StreamingResponse, LettaResponse]:
         include_final_message = True
         if not stream_steps and stream_tokens:
-            raise HTTPException(status_code=400, detail="stream_steps must be 'true' if stream_tokens is 'true'")
+            raise ValueError("stream_steps must be 'true' if stream_tokens is 'true'")
 
-        try:
-            # fetch the group
-            group = self.group_manager.retrieve_group(group_id=group_id, actor=actor)
-            letta_multi_agent = self.load_multi_agent(group=group, actor=actor)
+        group = self.group_manager.retrieve_group(group_id=group_id, actor=actor)
+        letta_multi_agent = self.load_multi_agent(group=group, actor=actor)
 
-            llm_config = letta_multi_agent.agent_state.llm_config
-            supports_token_streaming = ["openai", "anthropic", "deepseek"]
-            if stream_tokens and (
-                llm_config.model_endpoint_type not in supports_token_streaming or "inference.memgpt.ai" in llm_config.model_endpoint
-            ):
-                warnings.warn(
-                    f"Token streaming is only supported for models with type {' or '.join(supports_token_streaming)} in the model_endpoint: agent has endpoint type {llm_config.model_endpoint_type} and {llm_config.model_endpoint}. Setting stream_tokens to False."
-                )
-                stream_tokens = False
+        llm_config = letta_multi_agent.agent_state.llm_config
+        supports_token_streaming = ["openai", "anthropic", "deepseek"]
+        if stream_tokens and (
+            llm_config.model_endpoint_type not in supports_token_streaming or "inference.memgpt.ai" in llm_config.model_endpoint
+        ):
+            warnings.warn(
+                f"Token streaming is only supported for models with type {' or '.join(supports_token_streaming)} in the model_endpoint: agent has endpoint type {llm_config.model_endpoint_type} and {llm_config.model_endpoint}. Setting stream_tokens to False."
+            )
+            stream_tokens = False
 
-            # Create a new interface per request
-            letta_multi_agent.interface = StreamingServerInterface(
-                use_assistant_message=use_assistant_message,
-                assistant_message_tool_name=assistant_message_tool_name,
-                assistant_message_tool_kwarg=assistant_message_tool_kwarg,
-                inner_thoughts_in_kwargs=(
-                    llm_config.put_inner_thoughts_in_kwargs if llm_config.put_inner_thoughts_in_kwargs is not None else False
+        # Create a new interface per request
+        letta_multi_agent.interface = StreamingServerInterface(
+            use_assistant_message=use_assistant_message,
+            assistant_message_tool_name=assistant_message_tool_name,
+            assistant_message_tool_kwarg=assistant_message_tool_kwarg,
+            inner_thoughts_in_kwargs=(
+                llm_config.put_inner_thoughts_in_kwargs if llm_config.put_inner_thoughts_in_kwargs is not None else False
+            ),
+        )
+        streaming_interface = letta_multi_agent.interface
+        if not isinstance(streaming_interface, StreamingServerInterface):
+            raise ValueError(f"Agent has wrong type of interface: {type(streaming_interface)}")
+        streaming_interface.streaming_mode = stream_tokens
+        streaming_interface.streaming_chat_completion_mode = chat_completion_mode
+        if metadata and hasattr(streaming_interface, "metadata"):
+            streaming_interface.metadata = metadata
+
+        streaming_interface.stream_start()
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                letta_multi_agent.step,
+                messages=messages,
+                chaining=self.chaining,
+                max_chaining_steps=self.max_chaining_steps,
+            )
+        )
+
+        if stream_steps:
+            # return a stream
+            return StreamingResponse(
+                sse_async_generator(
+                    streaming_interface.get_generator(),
+                    usage_task=task,
+                    finish_message=include_final_message,
                 ),
-            )
-            streaming_interface = letta_multi_agent.interface
-            if not isinstance(streaming_interface, StreamingServerInterface):
-                raise ValueError(f"Agent has wrong type of interface: {type(streaming_interface)}")
-            streaming_interface.streaming_mode = stream_tokens
-            streaming_interface.streaming_chat_completion_mode = chat_completion_mode
-            if metadata and hasattr(streaming_interface, "metadata"):
-                streaming_interface.metadata = metadata
-
-            streaming_interface.stream_start()
-            task = asyncio.create_task(
-                asyncio.to_thread(
-                    letta_multi_agent.step,
-                    messages=messages,
-                    chaining=self.chaining,
-                    max_chaining_steps=self.max_chaining_steps,
-                )
+                media_type="text/event-stream",
             )
 
-            if stream_steps:
-                # return a stream
-                return StreamingResponse(
-                    sse_async_generator(
-                        streaming_interface.get_generator(),
-                        usage_task=task,
-                        finish_message=include_final_message,
-                    ),
-                    media_type="text/event-stream",
-                )
+        else:
+            # buffer the stream, then return the list
+            generated_stream = []
+            async for message in streaming_interface.get_generator():
+                assert (
+                    isinstance(message, LettaMessage) or isinstance(message, LegacyLettaMessage) or isinstance(message, MessageStreamStatus)
+                ), type(message)
+                generated_stream.append(message)
+                if message == MessageStreamStatus.done:
+                    break
 
-            else:
-                # buffer the stream, then return the list
-                generated_stream = []
-                async for message in streaming_interface.get_generator():
-                    assert (
-                        isinstance(message, LettaMessage)
-                        or isinstance(message, LegacyLettaMessage)
-                        or isinstance(message, MessageStreamStatus)
-                    ), type(message)
-                    generated_stream.append(message)
-                    if message == MessageStreamStatus.done:
-                        break
+            # Get rid of the stream status messages
+            filtered_stream = [d for d in generated_stream if not isinstance(d, MessageStreamStatus)]
+            usage = await task
 
-                # Get rid of the stream status messages
-                filtered_stream = [d for d in generated_stream if not isinstance(d, MessageStreamStatus)]
-                usage = await task
-
-                # By default the stream will be messages of type LettaMessage or LettaLegacyMessage
-                # If we want to convert these to Message, we can use the attached IDs
-                # NOTE: we will need to de-duplicate the Messsage IDs though (since Assistant->Inner+Func_Call)
-                # TODO: eventually update the interface to use `Message` and `MessageChunk` (new) inside the deque instead
-                return LettaResponse(messages=filtered_stream, usage=usage)
-        except HTTPException:
-            raise
-        except Exception as e:
-            print(e)
-            import traceback
-
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=f"{e}")
+            # By default the stream will be messages of type LettaMessage or LettaLegacyMessage
+            # If we want to convert these to Message, we can use the attached IDs
+            # NOTE: we will need to de-duplicate the Messsage IDs though (since Assistant->Inner+Func_Call)
+            # TODO: eventually update the interface to use `Message` and `MessageChunk` (new) inside the deque instead
+            return LettaResponse(messages=filtered_stream, usage=usage)

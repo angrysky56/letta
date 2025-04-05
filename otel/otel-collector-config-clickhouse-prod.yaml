@@ -41,12 +41,6 @@ processors:
     send_batch_size: 1024
 
 exporters:
-  file:
-    path: /root/.letta/logs/traces.json
-    rotation:
-      max_megabytes: 100
-      max_days: 7
-      max_backups: 5
   clickhouse:
     endpoint: ${CLICKHOUSE_ENDPOINT}
     database: ${CLICKHOUSE_DATABASE}
@@ -61,13 +55,29 @@ exporters:
       max_interval: 30s
       max_elapsed_time: 300s
 
+extensions:
+  health_check:
+  pprof:
+  zpages:
+
 service:
+  telemetry:
+    logs:
+      level: debug
+      development: true
+    metrics:
+      address: 0.0.0.0:8888
+  extensions: [health_check, pprof, zpages]
   pipelines:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [file, clickhouse]
+      exporters: [clickhouse]
     logs:
       receivers: [filelog]
+      processors: [batch]
+      exporters: [clickhouse]
+    metrics:
+      receivers: [otlp]
       processors: [batch]
       exporters: [clickhouse]

@@ -18,6 +18,12 @@ class ToolSettings(BaseSettings):
     # Local Sandbox configurations
     local_sandbox_dir: Optional[str] = None
 
+    # MCP settings
+    mcp_connect_to_server_timeout: float = 30.0
+    mcp_list_tools_timeout: float = 30.0
+    mcp_execute_tool_timeout: float = 60.0
+    mcp_read_from_config: bool = True  # if False, will throw if attempting to read/write from file
+
 
 class SummarizerSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="letta_summarizer_", extra="ignore")
@@ -169,16 +175,33 @@ class Settings(BaseSettings):
     # multi agent settings
     multi_agent_send_message_max_retries: int = 3
     multi_agent_send_message_timeout: int = 20 * 60
-    multi_agent_concurrent_sends: int = 15
+    multi_agent_concurrent_sends: int = 50
 
     # telemetry logging
     verbose_telemetry_logging: bool = False
-    otel_exporter_otlp_endpoint: str = "http://localhost:4317"
+    otel_exporter_otlp_endpoint: Optional[str] = None  # otel default: "http://localhost:4317"
+    disable_tracing: bool = False
 
     # uvicorn settings
     uvicorn_workers: int = 1
     uvicorn_reload: bool = False
     uvicorn_timeout_keep_alive: int = 5
+
+    # event loop parallelism
+    event_loop_threadpool_max_workers: int = 43
+
+    # experimental toggle
+    use_experimental: bool = False
+
+    # LLM provider client settings
+    httpx_max_retries: int = 5
+    httpx_timeout_connect: float = 10.0
+    httpx_timeout_read: float = 60.0
+    httpx_timeout_write: float = 30.0
+    httpx_timeout_pool: float = 10.0
+    httpx_max_connections: int = 500
+    httpx_max_keepalive_connections: int = 500
+    httpx_keepalive_expiry: float = 120.0
 
     @property
     def letta_pg_uri(self) -> str:
